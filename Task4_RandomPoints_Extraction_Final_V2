@@ -1,0 +1,97 @@
+# -*- coding: utf-8 -*-
+import arcpy
+import os
+import csv
+import glob
+
+# ================= 配置区域 =================
+# 1. 输入 TIF 文件夹路径 (请确保路径正确，不要有多余空格)
+INPUT_FOLDER = r"E:\paper1\shuju\LULC\4aligned_intersect"
+
+# 2. 输出 CSV 文件路径
+OUTPUT_CSV = r"E:\paper1\shuju\fragstats_batch_list.csv"
+
+# 3. FRAGSTATS 参数设置 (根据你的图片设定)
+BACKGROUND_VALUE = 999  # 背景值 (FRAGSTATS 将忽略此值，通常设为 9999 或 0)
+BAND_NUMBER = 1  # 波段数 (通常为 1)
+INPUT_FORMAT = "IDF_GeoTIFF"  # 输入数据格式标识
+
+
+# ================= 主程序 =================
+def generate_fragstats_batch():
+    # 查找所有 tif 文件
+    tif_pattern = os.path.join(INPUT_FOLDER, "*.tif")
+    tif_files = glob.glob(tif_pattern)
+
+    if not tif_files:
+        print(f"错误：在 {INPUT_FOLDER} 下未找到 .tif 文件！")
+        return
+
+    print(f"找到 {len(tif_files)} 个影像文件，开始提取元数据...")
+
+    # 准备写入 CSV
+    # newline='' 防止生成空行
+    with open(OUTPUT_CSV, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+
+        # 注意：FRAGSTATS 批量导入通常不需要表头，直接写入数据行
+        # 如果你的版本需要表头，可以取消下面这行的注释
+        # writer.writerow(["File_Name", "Cell_Size", "Background", "Rows", "Cols", "Band", "NoData", "Input_Type"])
+
+        count = 0
+        for raster_path in tif_files:
+            try:
+                # 获取绝对路径
+                abs_path = os.path.abspath(raster_path)
+
+                # 使用 arcpy 获取栅格属性
+                desc = arcpy.Describe(raster_path)
+
+                # 1. 获取像元大小 (取X方向，通常XY一致)
+                cell_size = desc.meanCellWidth
+
+                # 2. 获取行数 (Height) 和 列数 (Width)
+                rows = desc.height
+                cols = desc.width
+
+                # 3. 获取 NoData 值
+                # arcpy 返回的是一个对象，如果没有 NoData 可能报错或返回 None
+                try:
+                    no_data_val = desc.noDataValue
+                    # 如果获取到的 NoData 是极大的浮点数，或者 None，建议给个默认值
+                    if no_data_val is None:
+                        no_data_val = -9999
+                except:
+                    no_data_val = -9999
+
+                # 构建符合你图片格式的行数据
+                # 格式: [路径, 像元大小, 背景值, 行数, 列数, 波段号, NoData, 格式]
+                row_data = [
+                    abs_path,  # File Name
+                    cell_size,  # Cell Size
+                    BACKGROUND_VALUE,  # Background value (999)
+                    rows,  # Number of rows
+                    cols,  # Number of columns
+                    BAND_NUMBER,  # Band number (1)
+                    no_data_val,  # Nodata value
+                    INPUT_FORMAT  # Input data format
+                ]
+
+                # 写入 CSV
+                writer.writerow(row_data)
+                count += 1
+                if count % 5 == 0:
+                    print(f"已处理 {count} 个文件...")
+
+            except Exception as e:
+                print(f"处理文件失败: {os.path.basename(raster_path)}")
+                print(f"错误信息: {e}")
+
+    print("-" * 30)
+    print(f"处理完成！成功生成 {count} 条记录。")
+    print(f"CSV文件已保存至: {OUTPUT_CSV}")
+    print("请在 FRAGSTATS 中使用 'Import batch file' 功能导入此 CSV。")
+
+
+if __name__ == "__main__":
+    generate_fragstats_batch()
