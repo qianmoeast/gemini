@@ -1,4 +1,133 @@
 # -*- coding: utf-8 -*-
+# Task4_RandomPoints_Extraction_Integrated_Final.py
+# 运行环境：ArcGIS Pro Python (arcpy)
+
+import arcpy
+from arcpy.sa import *
+import os
+import pandas as pd
+
+# ================= 1. 参数配置区域 =================
+
+# 工作空间设置
+WORK_DIR = r"E:\paper1"
+arcpy.env.workspace = WORK_DIR
+arcpy.env.overwriteOutput = True
+arcpy.CheckOutExtension("Spatial")
+
+# --- 输入数据路径 ---
+LULC_DIR = r"E:\paper1\shuju\LULC\4aligned_intersect"
+CLIMATE_DIR = r"Z:\datasat\0000A\zhujx\raster\qixiangshuju\qihou2"
+DEM_PATH = r"E:\paper1\shuju\dem\Extract_dem_250m.tif"
+SLOPE_ASPECT_DIR = r"E:\paper1\shuju\Slope Aspect"
+SOIL_DIR = r"E:\paper1\shuju\SoilGrids\SoilGrids_Step2"
+GDP_DIR = r"E:\paper1\shuju\GDP\2res"
+POP_DIR = r"E:\paper1\shuju\GlobPOP\2res"
+TRANSITION_MAP_PATH = r"E:\paper1\result\Transition_Matrix\LULC_Transition_Map_1990_2020.tif"
+
+# --- 输出路径 ---
+OUTPUT_SHP_DIR = r"E:\paper1\shuju\shp"
+OUTPUT_CSV_DIR = r"E:\paper1\excel"
+
+if not os.path.exists(OUTPUT_SHP_DIR): os.makedirs(OUTPUT_SHP_DIR)
+if not os.path.exists(OUTPUT_CSV_DIR): os.makedirs(OUTPUT_CSV_DIR)
+
+# 目标年份
+TARGET_YEARS = [1990, 1995, 2000, 2005, 2010, 2015, 2020]
+
+# 随机点设置
+NUM_POINTS = 100000 
+MIN_DISTANCE = "1 Kilometers"
+
+# 湿地提取筛选代码 (1:水田, 2:库塘, 3:滩涂, 4:沼泽, 5:河流)
+VALID_WET_CODES = [1, 2, 3, 4, 5]
+
+# ================= 2. 辅助函数 =================
+
+def find_file(directory, keywords, ext=".tif"):
+    """模糊查找文件"""
+    if not os.path.exists(directory): return None
+    for f in os.listdir(directory):
+        if f.endswith(ext) and all(k in f for k in keywords):
+            return os.path.join(directory, f)
+    return None
+
+def get_year_suffix(year):
+    """生成年份后缀，例如 1990 -> 90"""
+    return str(year)[-2:]
+
+# ================= 3. 核心流程 =================
+
+def main():
+    print(">>> 开始执行集成提取任务...")
+
+    # --- 步骤 1: 生成或加载随机点 ---
+    # 我们将创建一个 Master Shapefile，所有数据都提取到这里
+    master_shp = os.path.join(OUTPUT_SHP_DIR, "Master_Sample_Points.shp")
+    
+    if not arcpy.Exists(master_shp):
+        print("  正在生成随机点模板 (基于2020年LULC)...")
+        lulc_2020 = os.path.join(LULC_DIR, "2020.tif")
+        if not os.path.exists(lulc_2020):
+            print("  [错误] 找不到2020年LULC数据，无法生成点。")
+            return
+            
+        # 提取有效区域 (1-4) 用于布点
+        temp_poly = os.path.join(OUTPUT_SHP_DIR, "Temp_Valid_Area.shp")
+        ras = Raster(lulc_2020)
+        # 注意：这里根据您的需求，如果是要研究全域，可以用 >0；
+        # 如果只关注湿地变化区域，可以用 (ras >= 1) & (ras <= 5)
+        # 这里假设只要有 LULC 数据的区域都可以布点
+        valid_area = Con(ras > 0, 1) 
+        arcpy.conversion.RasterToPolygon(valid_area, temp_poly, "SIMPLIFY", "VALUE")
+        
+        arcpy.management.CreateRandomPoints(
+            out_path=OUTPUT_SHP_DIR, 
+            out_name="Master_Sample_Points.shp",
+            constraining_feature_class=temp_poly,
+            number_of_points_or_field=NUM_POINTS,
+            minimum_allowed_distance=MIN_DISTANCE
+        )
+        arcpy.management.Delete(temp_poly)
+        print(f"  随机点已生成: {master_shp}")
+    else:
+        print(f"  使用现有的主点文件: {master_shp}")
+
+    # --- 步骤 2: 构建提取列表 (静态变量 + 动态变量) ---
+    extract_list = []
+    
+    # A. 静态变量 (不随年份变化)
+    print("  准备静态变量...")
+    if os.path.exists(DEM_PATH): extract_list.append([DEM_PATH, "DEM"])
+    
+    slope = find_file(SLOPE_ASPECT_DIR, ["slope"], ".tif")
+    if slope: extract_list.append([slope, "Slope"])
+    
+    aspect = find_file(SLOPE_ASPECT_DIR, ["aspect"], ".tif")
+    if aspect: extract_list.append([aspect, "Aspect"])
+    
+    # LUCC_C (转移矩阵) 是静态的，所有年份都用同一列值
+    if os.path.exists(TRANSITION_MAP_PATH): extract_list.append([TRANSITION_MAP_PATH, "LUCC_C"])
+    
+    # 土壤数据
+    if os.path.exists(SOIL_DIR):
+        for f in os.listdir(SOIL_DIR):
+            if f.endswith(".tif"):
+                # 简化名称: TP_SoilGrids_bdod_5 -> bdod_5
+                fname = os.path.splitext(f)[0].replace("TP_SoilGrids_", "")
+                extract_list.append([os.path.join(SOIL_DIR, f), fname])
+
+    # B. 动态变量 (随年份变化)
+    print("  准备动态年份变量...")
+    
+    for year in TARGET_YEARS:
+        ys = get_year_suffix(year) # 90, 95...
+        
+        # 1. LULC -> LULC_90
+        p = os.path.join(LULC_DIR, f"{year}.tif")
+        if os.path.exists(p): extract_list.append([p, f"LULC_{ys}"])
+        
+        # 2. Climate -> pre_# -*- coding: utf-8 -*-
 # Task4_RandomPoints_Extraction_Integrated.py
 # 运行环境：ArcGIS Pro Python (arcpy)
 
