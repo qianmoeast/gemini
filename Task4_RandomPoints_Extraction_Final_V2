@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# Task4_RandomPoints_Extraction_Integrated_V4.py
+# Task4_RandomPoints_Extraction_Integrated_Consistent.py
 # 运行环境：ArcGIS Pro Python (arcpy)
 
 import arcpy
@@ -16,18 +16,13 @@ arcpy.env.overwriteOutput = True
 arcpy.CheckOutExtension("Spatial")
 
 # --- 输入数据路径 ---
-# 【修改】LULC 数据路径改为 5resmple
 LULC_DIR = r"E:\paper1\shuju\LULC\5resmple"
-
 CLIMATE_DIR = r"Z:\datasat\0000A\zhujx\raster\qixiangshuju\qihou2"
 DEM_PATH = r"E:\paper1\shuju\dem\Extract_dem_250m.tif"
 SLOPE_ASPECT_DIR = r"E:\paper1\shuju\Slope Aspect"
 SOIL_DIR = r"E:\paper1\shuju\SoilGrids\SoilGrids_Step2"
 GDP_DIR = r"E:\paper1\shuju\GDP\2res"
 POP_DIR = r"E:\paper1\shuju\GlobPOP\2res"
-
-# 【修改】暂时不提取转移矩阵，注释掉路径
-# TRANSITION_MAP_PATH = r"E:\paper1\result\Transition_Matrix\LULC_Transition_Map_1990_2020.tif"
 
 # --- 输出路径 ---
 OUTPUT_SHP_DIR = r"E:\paper1\shuju\shp"
@@ -63,23 +58,21 @@ def get_year_suffix(year):
 # ================= 3. 核心流程 =================
 
 def main():
-    print(">>> 开始执行集成提取任务 (Source: 5resmple)...")
+    print(">>> 开始执行集成提取任务 (全局一致性版)...")
 
     # --- 步骤 1: 生成或加载随机点 ---
-    # 我们将创建一个 Master Shapefile，所有数据都提取到这里
     master_shp = os.path.join(OUTPUT_SHP_DIR, "Master_Sample_Points.shp")
     
     if not arcpy.Exists(master_shp):
         print("  正在生成随机点模板 (基于2020年LULC)...")
-        # 使用新路径下的 2020.tif 生成点
         lulc_2020 = os.path.join(LULC_DIR, "2020.tif")
         if not os.path.exists(lulc_2020):
             print(f"  [错误] 找不到2020年LULC数据 ({lulc_2020})，无法生成点。")
             return
             
-        # 提取有效区域 (值 > 0 的区域均可布点)
         temp_poly = os.path.join(OUTPUT_SHP_DIR, "Temp_Valid_Area.shp")
         ras = Raster(lulc_2020)
+        # 只要有值的区域都可布点 (LULC > 0)
         valid_area = Con(ras > 0, 1) 
         arcpy.conversion.RasterToPolygon(valid_area, temp_poly, "SIMPLIFY", "VALUE")
         
@@ -95,10 +88,10 @@ def main():
     else:
         print(f"  使用现有的主点文件: {master_shp}")
 
-    # --- 步骤 2: 构建提取列表 (静态变量 + 动态变量) ---
+    # --- 步骤 2: 构建提取列表 ---
     extract_list = []
     
-    # A. 静态变量 (不随年份变化)
+    # A. 静态变量
     print("  准备静态变量...")
     if os.path.exists(DEM_PATH): extract_list.append([DEM_PATH, "DEM"])
     
@@ -108,44 +101,37 @@ def main():
     aspect = find_file(SLOPE_ASPECT_DIR, ["aspect"], ".tif")
     if aspect: extract_list.append([aspect, "Aspect"])
     
-    # 【修改】已注释掉转移矩阵提取
-    # if os.path.exists(TRANSITION_MAP_PATH): extract_list.append([TRANSITION_MAP_PATH, "LUCC_C"])
-    
-    # 土壤数据
     if os.path.exists(SOIL_DIR):
         for f in os.listdir(SOIL_DIR):
             if f.endswith(".tif"):
-                # 简化名称: TP_SoilGrids_bdod_5 -> bdod_5
                 fname = os.path.splitext(f)[0].replace("TP_SoilGrids_", "")
                 extract_list.append([os.path.join(SOIL_DIR, f), fname])
 
-    # B. 动态变量 (随年份变化)
+    # B. 动态年份变量
     print("  准备动态年份变量...")
     
     for year in TARGET_YEARS:
         ys = get_year_suffix(year) # 90, 95...
         
-        # 1. LULC -> LULC_90 (从 5resmple 文件夹读取)
+        # 1. LULC
         p = os.path.join(LULC_DIR, f"{year}.tif")
-        if os.path.exists(p): 
-            extract_list.append([p, f"LULC_{ys}"])
-        else:
-            print(f"  [警告] 缺失 LULC {year} at {p}")
+        if os.path.exists(p): extract_list.append([p, f"LULC_{ys}"])
+        else: print(f"  [警告] 缺失 LULC {year}")
         
-        # 2. Climate -> pre_90, tmp_90...
+        # 2. Climate
         for var in ["pre", "tmp", "tmx", "tmn", "pet"]:
             p = find_file(os.path.join(CLIMATE_DIR, var), [str(year)])
             if not p: p = find_file(CLIMATE_DIR, [var, str(year)])
             if p: extract_list.append([p, f"{var}_{ys}"])
             
-        # 3. GDP -> GDPT_90, GDPP_90
+        # 3. GDP
         p = find_file(GDP_DIR, ["Total", str(year)])
         if p: extract_list.append([p, f"GDPT_{ys}"])
         
         p = find_file(GDP_DIR, ["PerCapita", str(year)])
         if p: extract_list.append([p, f"GDPP_{ys}"])
         
-        # 4. POP -> POPC_90, POPD_90
+        # 4. POP
         p = find_file(POP_DIR, ["Count", str(year)])
         if p: extract_list.append([p, f"POPC_{ys}"])
         
@@ -153,32 +139,53 @@ def main():
         if p: extract_list.append([p, f"POPD_{ys}"])
 
     # --- 步骤 3: 执行提取 ---
-    print(f"  正在将 {len(extract_list)} 个变量提取到 Shapefile (这可能需要几分钟)...")
+    print(f"  正在将 {len(extract_list)} 个变量提取到 Shapefile...")
     working_shp = "in_memory/working_points"
+    # 每次都覆盖内存图层，确保干净
+    if arcpy.Exists(working_shp): arcpy.management.Delete(working_shp)
     arcpy.management.CopyFeatures(master_shp, working_shp)
     
     try:
         arcpy.sa.ExtractMultiValuesToPoints(working_shp, extract_list, "NONE")
-        print("  提取完成！正在导出数据...")
+        print("  提取完成！正在处理数据...")
     except Exception as e:
         print(f"  [提取失败] {e}")
         return
 
-    # --- 步骤 4: 转换为 DataFrame 并分割导出 ---
+    # --- 步骤 4: 转换为 DataFrame 并执行全局清洗 ---
     
-    # 获取所有字段
     fields = [f.name for f in arcpy.ListFields(working_shp) if f.type not in ['Geometry', 'OID']]
     
-    # 读取数据
     data_rows = []
     with arcpy.da.SearchCursor(working_shp, ["OID@", "SHAPE@X", "SHAPE@Y"] + fields) as cursor:
         for row in cursor:
             data_rows.append(row)
             
-    # 主 DataFrame
+    # 生成宽表 (包含所有年份数据)
     master_df = pd.DataFrame(data_rows, columns=["PointID", "Lon", "Lat"] + fields)
     
-    # 识别静态字段 (所有年份通用的字段)
+    # 【关键修改】执行全局数据清洗
+    # 只要某一行在 任意年份 的 任意列 是空的，就直接删除整行
+    # 这样能保证留下来的点，在 1990-2020 都有完整数据
+    print(f"\n>>> 正在执行全局数据清洗 (确保所有年份点位一致)...")
+    initial_count = len(master_df)
+    
+    # dropna() 默认行为是：只要行内有 NaN 就删除该行
+    master_df.dropna(inplace=True)
+    
+    final_count = len(master_df)
+    dropped_count = initial_count - final_count
+    print(f"    初始点数: {initial_count}")
+    print(f"    清洗后点数: {final_count}")
+    print(f"    剔除无效点: {dropped_count}")
+    
+    if final_count == 0:
+        print("[错误] 所有点都被剔除了！请检查是否有某个图层完全没有覆盖到采样区。")
+        return
+
+    # --- 步骤 5: 逐年拆分并导出 ---
+    
+    # 识别静态字段
     static_cols = ["PointID", "Lon", "Lat"]
     for col in fields:
         is_dynamic = False
@@ -189,10 +196,9 @@ def main():
         if not is_dynamic:
             static_cols.append(col)
             
-    # 逐年处理并导出
     for year in TARGET_YEARS:
         ys = get_year_suffix(year)
-        print(f"\n>>> 处理年份 {year} 的输出...")
+        print(f"\n>>> 导出年份 {year} ...")
         
         # 1. 筛选并重命名列
         current_cols = static_cols.copy()
@@ -202,42 +208,34 @@ def main():
         for col in fields:
             if col.endswith(f"_{ys}"):
                 year_dynamic_cols.append(col)
-                # 还原标准列名: LULC_90 -> LULC
+                # 还原标准列名
                 base_name = col[:-3] 
-                # 处理缩写还原
                 if base_name == "GDPT": new_name = "GDP_T"
                 elif base_name == "GDPP": new_name = "GDP_P"
                 elif base_name == "POPC": new_name = "POP_C"
                 elif base_name == "POPD": new_name = "POP_D"
                 else: new_name = base_name
-                
                 rename_dict[col] = new_name
         
-        # 提取子集
+        # 提取子集 (此时数据已经是清洗过的，无需再次 dropna)
         df_year = master_df[current_cols + year_dynamic_cols].copy()
         df_year.rename(columns=rename_dict, inplace=True)
         df_year["Year"] = year
         
-        # 2. 导出 point_YYYY.csv (所有点)
+        # 2. 导出 point_YYYY.csv
+        p_out = os.path.join(OUTPUT_CSV_DIR, f"point_{year}.csv")
+        df_year.to_csv(p_out, index=False, encoding='utf-8-sig')
+        print(f"  [1] point_{year}.csv (共 {len(df_year)} 行)")
+        
+        # 3. 导出 wet_YYYY.csv (LULC 1-5)
         if "LULC" in df_year.columns:
-            # 清洗：去除关键数据缺失的行 (保留 LULC=0 的点)
-            df_point = df_year.dropna(subset=["LULC"])
-            
-            # 【输出1】包含所有地类 (包括0) 的表
-            p_out = os.path.join(OUTPUT_CSV_DIR, f"point_{year}.csv")
-            df_point.to_csv(p_out, index=False, encoding='utf-8-sig')
-            print(f"  [1] 已导出 point_{year}.csv (共 {len(df_point)} 行)")
-            
-            # 【输出2】仅包含湿地 (1-5) 的表
-            # 注意：确保 LULC 列是数值型
-            df_wet = df_point[df_point["LULC"].isin(VALID_WET_CODES)]
+            df_wet = df_year[df_year["LULC"].isin(VALID_WET_CODES)]
             w_out = os.path.join(OUTPUT_CSV_DIR, f"wet_{year}.csv")
             df_wet.to_csv(w_out, index=False, encoding='utf-8-sig')
-            print(f"  [2] 已导出 wet_{year}.csv   (共 {len(df_wet)} 行)")
+            # 注意：wet 表的行数在不同年份可能会变 (因为LULC在变)，
+            # 但 point 表的行数绝对是所有年份一致的。
+            print(f"  [2] wet_{year}.csv   (共 {len(df_wet)} 行)")
             
-        else:
-            print(f"  [警告] 缺失 LULC 数据，跳过导出。")
-
     if arcpy.Exists(working_shp): arcpy.management.Delete(working_shp)
     print("\n所有任务完成！")
 
