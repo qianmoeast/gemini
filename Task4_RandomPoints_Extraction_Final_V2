@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# Task4_RandomPoints_Extraction_Integrated_Final.py
+# Task4_RandomPoints_Extraction_Integrated_V4.py
 # 运行环境：ArcGIS Pro Python (arcpy)
 
 import arcpy
@@ -16,14 +16,18 @@ arcpy.env.overwriteOutput = True
 arcpy.CheckOutExtension("Spatial")
 
 # --- 输入数据路径 ---
-LULC_DIR = r"E:\paper1\shuju\LULC\4aligned_intersect"
+# 【修改】LULC 数据路径改为 5resmple
+LULC_DIR = r"E:\paper1\shuju\LULC\5resmple"
+
 CLIMATE_DIR = r"Z:\datasat\0000A\zhujx\raster\qixiangshuju\qihou2"
 DEM_PATH = r"E:\paper1\shuju\dem\Extract_dem_250m.tif"
 SLOPE_ASPECT_DIR = r"E:\paper1\shuju\Slope Aspect"
 SOIL_DIR = r"E:\paper1\shuju\SoilGrids\SoilGrids_Step2"
 GDP_DIR = r"E:\paper1\shuju\GDP\2res"
 POP_DIR = r"E:\paper1\shuju\GlobPOP\2res"
-TRANSITION_MAP_PATH = r"E:\paper1\result\Transition_Matrix\LULC_Transition_Map_1990_2020.tif"
+
+# 【修改】暂时不提取转移矩阵，注释掉路径
+# TRANSITION_MAP_PATH = r"E:\paper1\result\Transition_Matrix\LULC_Transition_Map_1990_2020.tif"
 
 # --- 输出路径 ---
 OUTPUT_SHP_DIR = r"E:\paper1\shuju\shp"
@@ -59,7 +63,7 @@ def get_year_suffix(year):
 # ================= 3. 核心流程 =================
 
 def main():
-    print(">>> 开始执行集成提取任务...")
+    print(">>> 开始执行集成提取任务 (Source: 5resmple)...")
 
     # --- 步骤 1: 生成或加载随机点 ---
     # 我们将创建一个 Master Shapefile，所有数据都提取到这里
@@ -67,17 +71,15 @@ def main():
     
     if not arcpy.Exists(master_shp):
         print("  正在生成随机点模板 (基于2020年LULC)...")
+        # 使用新路径下的 2020.tif 生成点
         lulc_2020 = os.path.join(LULC_DIR, "2020.tif")
         if not os.path.exists(lulc_2020):
-            print("  [错误] 找不到2020年LULC数据，无法生成点。")
+            print(f"  [错误] 找不到2020年LULC数据 ({lulc_2020})，无法生成点。")
             return
             
-        # 提取有效区域 (1-4) 用于布点
+        # 提取有效区域 (值 > 0 的区域均可布点)
         temp_poly = os.path.join(OUTPUT_SHP_DIR, "Temp_Valid_Area.shp")
         ras = Raster(lulc_2020)
-        # 注意：这里根据您的需求，如果是要研究全域，可以用 >0；
-        # 如果只关注湿地变化区域，可以用 (ras >= 1) & (ras <= 5)
-        # 这里假设只要有 LULC 数据的区域都可以布点
         valid_area = Con(ras > 0, 1) 
         arcpy.conversion.RasterToPolygon(valid_area, temp_poly, "SIMPLIFY", "VALUE")
         
@@ -106,8 +108,8 @@ def main():
     aspect = find_file(SLOPE_ASPECT_DIR, ["aspect"], ".tif")
     if aspect: extract_list.append([aspect, "Aspect"])
     
-    # LUCC_C (转移矩阵) 是静态的，所有年份都用同一列值
-    if os.path.exists(TRANSITION_MAP_PATH): extract_list.append([TRANSITION_MAP_PATH, "LUCC_C"])
+    # 【修改】已注释掉转移矩阵提取
+    # if os.path.exists(TRANSITION_MAP_PATH): extract_list.append([TRANSITION_MAP_PATH, "LUCC_C"])
     
     # 土壤数据
     if os.path.exists(SOIL_DIR):
@@ -123,9 +125,12 @@ def main():
     for year in TARGET_YEARS:
         ys = get_year_suffix(year) # 90, 95...
         
-        # 1. LULC -> LULC_90
+        # 1. LULC -> LULC_90 (从 5resmple 文件夹读取)
         p = os.path.join(LULC_DIR, f"{year}.tif")
-        if os.path.exists(p): extract_list.append([p, f"LULC_{ys}"])
+        if os.path.exists(p): 
+            extract_list.append([p, f"LULC_{ys}"])
+        else:
+            print(f"  [警告] 缺失 LULC {year} at {p}")
         
         # 2. Climate -> pre_90, tmp_90...
         for var in ["pre", "tmp", "tmx", "tmn", "pet"]:
@@ -215,7 +220,7 @@ def main():
         
         # 2. 导出 point_YYYY.csv (所有点)
         if "LULC" in df_year.columns:
-            # 清洗：去除关键数据缺失的行
+            # 清洗：去除关键数据缺失的行 (保留 LULC=0 的点)
             df_point = df_year.dropna(subset=["LULC"])
             
             # 【输出1】包含所有地类 (包括0) 的表
