@@ -153,3 +153,125 @@ def main():
         # 4. POP
         p = find_file(POP_DIR, ["Count", str(year)])
         if p: extract_list.append([p, f"POPC_{ys}"])
+        p = find_file(POP_DIR, ["Density", str(year)])
+        if p: extract_list.append([p, f"POPD_{ys}"])
+
+    # --- 步骤 3: 执行提取 (关键修改：使用硬盘临时文件) ---
+    print(f"  正在将 {len(extract_list)} 个变量提取到 Shapefile...")
+    
+    # 【修改点】: 使用硬盘上的真实文件，而不是内存
+    working_shp = os.path.join(OUTPUT_SHP_DIR, "Temp_Process_Points.shp")
+    
+    # 清理旧的临时文件
+    if arcpy.Exists(working_shp):
+        try:
+            arcpy.management.Delete(working_shp)
+        except:
+            print("  [警告] 无法删除旧的临时文件，请确保它未在ArcGIS中打开。")
+            return
+
+    print(f"  复制主点文件到临时文件: {working_shp} ...")
+    arcpy.management.CopyFeatures(master_shp, working_shp)
+    
+    # 再次检查文件是否存在
+    if not arcpy.Exists(working_shp):
+        print("[错误] 临时文件创建失败，请检查磁盘空间或权限。")
+        return
+
+    try:
+        # 核心提取步骤
+        arcpy.sa.ExtractMultiValuesToPoints(working_shp, extract_list, "NONE")
+        print("  提取完成！正在处理属性表...")
+    except Exception as e:
+        print(f"  [提取失败] 错误详情: {e}")
+        # 如果是 000860，通常是输入路径问题，现在用了绝对路径应该能解决
+        return
+
+    # --- 步骤 4: 转换为 DataFrame 并执行全局清洗 ---
+    
+    # 读取字段
+    fields = [f.name for f in arcpy.ListFields(working_shp) if f.type not in ['Geometry', 'OID']]
+    
+    print("  正在读取数据到内存 (Pandas)...")
+    data_rows = []
+    with arcpy.da.SearchCursor(working_shp, ["OID@", "SHAPE@X", "SHAPE@Y"] + fields) as cursor:
+        for row in cursor:
+            data_rows.append(row)
+            
+    master_df = pd.DataFrame(data_rows, columns=["PointID", "Lon", "Lat"] + fields)
+    
+    print(f"\n>>> 正在执行全局数据清洗 (确保所有年份点位一致)...")
+    initial_count = len(master_df)
+    
+    # 删除含有任何空值的行
+    master_df.dropna(inplace=True)
+    
+    final_count = len(master_df)
+    print(f"    初始点数: {initial_count}")
+    print(f"    清洗后点数: {final_count}")
+    print(f"    剔除无效点: {initial_count - final_count}")
+    
+    if final_count == 0:
+        print("[错误] 所有点都被剔除了！这通常意味着某个图层完全没有覆盖研究区，或者全是NoData。")
+        # 建议打印每一列的空值情况以便排查
+        # print(master_df.isnull().sum())
+        return
+
+    # --- 步骤 5: 逐年拆分并导出 ---
+    
+    # 识别静态字段
+    static_cols = ["PointID", "Lon", "Lat"]
+    for col in fields:
+        is_dynamic = False
+        for yr in TARGET_YEARS:
+            if col.endswith(f"_{get_year_suffix(yr)}"):
+                is_dynamic = True
+                break
+        if not is_dynamic:
+            static_cols.append(col)
+            
+    for year in TARGET_YEARS:
+        ys = get_year_suffix(year)
+        print(f"\n>>> 导出年份 {year} ...")
+        
+        current_cols = static_cols.copy()
+        rename_dict = {}
+        
+        year_dynamic_cols = []
+        for col in fields:
+            if col.endswith(f"_{ys}"):
+                year_dynamic_cols.append(col)
+                base_name = col[:-3] 
+                if base_name == "GDPT": new_name = "GDP_T"
+                elif base_name == "GDPP": new_name = "GDP_P"
+                elif base_name == "POPC": new_name = "POP_C"
+                elif base_name == "POPD": new_name = "POP_D"
+                else: new_name = base_name
+                rename_dict[col] = new_name
+        
+        # 提取并重命名
+        df_year = master_df[current_cols + year_dynamic_cols].copy()
+        df_year.rename(columns=rename_dict, inplace=True)
+        df_year["Year"] = year
+        
+        # [1] point_YYYY.csv
+        p_out = os.path.join(OUTPUT_CSV_DIR, f"point_{year}.csv")
+        df_year.to_csv(p_out, index=False, encoding='utf-8-sig')
+        print(f"  [1] point_{year}.csv (共 {len(df_year)} 行)")
+        
+        # [2] wet_YYYY.csv
+        if "LULC" in df_year.columns:
+            df_wet = df_year[df_year["LULC"].isin(VALID_WET_CODES)]
+            w_out = os.path.join(OUTPUT_CSV_DIR, f"wet_{year}.csv")
+            df_wet.to_csv(w_out, index=False, encoding='utf-8-sig')
+            print(f"  [2] wet_{year}.csv   (共 {len(df_wet)} 行)")
+
+    # 任务完成后删除临时文件
+    try:
+        if arcpy.Exists(working_shp): arcpy.management.Delete(working_shp)
+    except:
+        pass
+    print("\n所有任务完成！")
+
+if __name__ == "__main__":
+    main()
