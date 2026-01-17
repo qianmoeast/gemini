@@ -13,6 +13,7 @@ import os
 import re
 import gc
 import sys
+import time  # 引入时间模块以监控进度
 
 # 尝试导入 geoshapley
 try:
@@ -37,16 +38,15 @@ WETLAND_CODES = [1, 2, 3, 4, 5]
 # --- 【核心控制开关】 ---
 CONFIG = {
     # 1. 是否使用全量数据进行解释？
-    # True = 使用所有数据
-    # False = 使用抽样数据
+    # 【已开启】使用全量数据
     "USE_FULL_DATA": False,
 
-    # 2. 如果 USE_FULL_DATA = False，则使用以下样本量：
+    # 2. 样本量配置 (仅当 USE_FULL_DATA=False 时生效，全量模式下忽略 SHAP/GEOSHAP_SAMPLE_SIZE)
     "SHAP_SAMPLE_SIZE": 8000,
     "GEOSHAP_SAMPLE_SIZE": 5000,
 
-    # 【关键修复】背景数据绝对不能设为 1000！
-    # 50 个背景样本已足够提供统计学基准，且能保证内存不爆炸。
+    # 【核心安全锁】GeoShapley 背景数据集大小
+    # 保持为 50，这是全量数据能跑通的关键！千万不要改回 1000。
     "GEOSHAP_BG_SIZE": 50,
 
     # 3. 特征重要性图中是否剔除经纬度？
@@ -72,7 +72,7 @@ print(f"共发现 {len(all_files)} 个年份的数据文件，准备开始分析
 # 2. 逐年循环分析
 # ==========================================
 for filepath in all_files:
-    gc.collect()
+    gc.collect()  # 强制回收内存
 
     filename = os.path.basename(filepath)
     match = re.search(r'\d{4}', filename)
@@ -81,6 +81,8 @@ for filepath in all_files:
     print(f"\n{'=' * 50}")
     print(f"正在处理年份: {year}")
     print(f"{'=' * 50}")
+
+    start_time = time.time()  # 计时开始
 
     try:
         # --- 2.1 数据准备 ---
@@ -119,6 +121,8 @@ for filepath in all_files:
         # 划分训练集
         X_train, X_test, y_train, y_test = train_test_split(df_features, y, test_size=0.3, random_state=42, stratify=y)
 
+        print(f"  数据加载完毕: 总行数 {len(df_features)}")
+
         # --- 2.2 模型训练 (CPU) ---
         scale_pos_weight = (len(y) - y.sum()) / y.sum()
         model = xgb.XGBClassifier(
@@ -127,7 +131,7 @@ for filepath in all_files:
             max_depth=6,
             scale_pos_weight=scale_pos_weight,
             random_state=42,
-            n_jobs=-1,  # CPU 多核并行训练
+            n_jobs=-1,  # 使用所有 CPU 核心加速训练
             eval_metric='logloss'
         )
         model.fit(X_train, y_train)
@@ -148,7 +152,7 @@ for filepath in all_files:
 
         df_importance = df_importance.sort_values(by='importance', ascending=True)
 
-        # 绘图
+        # 绘图逻辑
         fig, ax = plt.subplots(figsize=(12, 10))
         df_plot_imp = df_importance.tail(25)
 
@@ -195,9 +199,10 @@ for filepath in all_files:
         print(f"已保存: {save_path}")
 
         # =============================================================================
-        # 5. SHAP 分析
+        # 5. SHAP 分析 (CPU)
         # =============================================================================
         print(f"[{year}] SHAP 分析...")
+        # CPU 版本的 TreeExplainer 对 XGBoost 优化得非常好，全量数据通常也能在几分钟内跑完
         explainer = shap.TreeExplainer(model)
 
         if CONFIG["USE_FULL_DATA"]:
@@ -222,11 +227,11 @@ for filepath in all_files:
         print(f"已保存: SHAP_Summary_{year}.jpg")
 
         # =============================================================================
-        # 6. GeoShapley 分析 (CPU 版)
+        # 6. GeoShapley 分析 (CPU)
         # =============================================================================
-        print(f"[{year}] GeoShapley 分析...")
+        print(f"[{year}] GeoShapley 分析 (全量模式，可能较慢，请耐心等待)...")
 
-        # 【修复】使用小规模背景数据 (50)，防止内存溢出
+        # 【核心配置】背景数据 50 个
         bg_size = CONFIG["GEOSHAP_BG_SIZE"]
         bg_data = X_train.sample(min(bg_size, len(X_train)), random_state=42)
 
@@ -235,14 +240,16 @@ for filepath in all_files:
         try:
             if CONFIG["USE_FULL_DATA"]:
                 data_to_explain = df_features
-                print(f"  解释全量数据 ({len(data_to_explain)} 行)...")
+                print(f"  正在解释全量数据 ({len(data_to_explain)} 行)...")
+                # 估算内存占用：130000行 * 50背景 * 20特征 * 8字节 ≈ 1GB
+                # 您的电脑完全可以承受，主要瓶颈是 CPU 计算时间
             else:
                 sample_n = min(CONFIG["GEOSHAP_SAMPLE_SIZE"], len(df_features))
                 data_to_explain = df_features.sample(sample_n, random_state=42)
-                print(f"  解释抽样数据 ({len(data_to_explain)} 行)...")
+                print(f"  正在解释抽样数据 ({len(data_to_explain)} 行)...")
 
-            # 在 CPU 模式下，可以使用多核并行
-            # n_jobs=-1 使用所有可用核心，背景数据调小后内存应该足够
+            # 在 CPU 模式下使用 n_jobs=-1 拉满 CPU 核心
+            # 由于 bg_size 只有 50，内存不会溢出
             geoshapley_results = geoshap_explainer.explain(data_to_explain, n_jobs=-1)
 
             # --- 发散条形图 ---
@@ -289,6 +296,10 @@ for filepath in all_files:
             import traceback
 
             traceback.print_exc()
+
+        # 打印耗时
+        elapsed = time.time() - start_time
+        print(f"[{year}] 处理完成，耗时: {elapsed / 60:.2f} 分钟")
 
     except Exception as e:
         print(f"处理年份 {year} 时出错: {e}")
