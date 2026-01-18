@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
-# Task4_RandomPoints_Extraction_UpdatedPaths.py
+# Task4_RandomPoints_Extraction_UpdatedPaths_TimeTrack.py
 # 运行环境：ArcGIS Pro Python (arcpy)
 
 import arcpy
 from arcpy.sa import *
 import os
 import pandas as pd
+import time  # 【新增】导入时间模块
 
 # ================= 1. 参数配置区域 =================
 
@@ -17,10 +18,10 @@ arcpy.CheckOutExtension("Spatial")
 
 # --- 输入数据路径 (基于提供的目录结构更新) ---
 
-# 1. LULC 数据 (使用 5resmple 文件夹) 
+# 1. LULC 数据 (使用 5resmple 文件夹)
 LULC_DIR = r"E:\paper1\shuju\0LULC\5resmple"
 
-# 2. 动态驱动因子 (Dynamic drivers) 
+# 2. 动态驱动因子 (Dynamic drivers)
 # 气候数据
 CLIMATE_DIR = r"E:\paper1\shuju\1raster_clip\1Dynamic drivers\climate"
 # GDP 数据
@@ -28,22 +29,20 @@ GDP_DIR = r"E:\paper1\shuju\1raster_clip\1Dynamic drivers\GDP"
 # 人口数据
 POP_DIR = r"E:\paper1\shuju\1raster_clip\1Dynamic drivers\GlobPOP"
 
-# 3. 静态驱动因子 (Static driver) 
+# 3. 静态驱动因子 (Static driver)
 STATIC_DIR = r"E:\paper1\shuju\1raster_clip\1Static driver"
 
 # 地形相关 (DEM, Slope, Aspect, TWI)
-# DEM 使用 Extract_dem_250m.tif 
 DEM_PATH = os.path.join(STATIC_DIR, "dem", "Extract_dem_250m.tif")
-# Slope 和 Aspect 
 SLOPE_ASPECT_DIR = os.path.join(STATIC_DIR, "Slope Aspect")
 SLOPE_PATH = os.path.join(SLOPE_ASPECT_DIR, "Slope.tif")
 ASPECT_PATH = os.path.join(SLOPE_ASPECT_DIR, "Aspect.tif")
 TWI_PATH = os.path.join(SLOPE_ASPECT_DIR, "TWI.sdat")
 
-# 土壤数据 (China soil) 
+# 土壤数据 (China soil)
 SOIL_DIR = os.path.join(STATIC_DIR, "China soil")
 
-# 【新增】冻土矢量数据路径 (假设路径未变，如果变了请修改)
+# 冻土矢量数据路径
 FROZEN_SHP_PATH = r"E:\paper1\shuju\Frozen_soil\Frozen_soil_Ran2012.shp"
 
 # --- 输出路径 ---
@@ -81,6 +80,13 @@ def get_year_suffix(year):
 # ================= 3. 核心流程 =================
 
 def main():
+    # 【新增】记录开始时间
+    t_start = time.time()
+    start_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(t_start))
+    print(f"=======================================================")
+    print(f"任务开始时间: {start_str}")
+    print(f"=======================================================\n")
+    
     print(">>> 开始执行集成提取任务 (更新路径版)...")
 
     # --- 步骤 1: 生成或加载随机点 ---
@@ -88,7 +94,6 @@ def main():
 
     if not arcpy.Exists(master_shp):
         print("  正在生成随机点模板 (基于2020年LULC)...")
-        # 路径更新为 LULC_DIR
         lulc_2020 = os.path.join(LULC_DIR, "2020.tif")
         if not os.path.exists(lulc_2020):
             print(f"  [错误] 找不到2020年LULC数据 ({lulc_2020})")
@@ -203,35 +208,28 @@ def main():
         else:
             print(f"  [警告] 缺失 LULC {year}")
 
-        # 2. Climate (来自 1Dynamic drivers/climate)
-        # 根据目录结构，climate下有 pet, pre, rhum, sard, tmn, tmp, tmx, wind 文件夹
-        # 每个文件夹里应该有对应年份的 tif
+        # 2. Climate
         clim_vars = ["pet", "pre", "tmp", "tmx", "tmn"]
         for var in clim_vars:
-            # 构建变量文件夹路径
             var_dir = os.path.join(CLIMATE_DIR, var)
-            # 查找该年份的文件
             p = find_file(var_dir, [str(year)])
             if p:
                 extract_list.append([p, f"{var}_{ys}"])
             else:
-                # 备用查找：直接在 climate 目录下找 (如果文件没分文件夹)
                 p = find_file(CLIMATE_DIR, [var, str(year)])
                 if p:
                     extract_list.append([p, f"{var}_{ys}"])
                 else:
                     print(f"  [警告] 缺失气候数据 {var} {year}")
 
-        # 3. GDP (来自 1Dynamic drivers/GDP)
-        # 查找 Total 和 PerCapita
+        # 3. GDP
         p = find_file(GDP_DIR, ["Total", str(year)])
         if p: extract_list.append([p, f"GDPT_{ys}"])
         
         p = find_file(GDP_DIR, ["PerCapita", str(year)])
         if p: extract_list.append([p, f"GDPP_{ys}"])
 
-        # 4. POP (来自 1Dynamic drivers/GlobPOP)
-        # 查找 Count 和 Density
+        # 4. POP
         p = find_file(POP_DIR, ["Count", str(year)])
         if p: extract_list.append([p, f"POPC_{ys}"])
         
@@ -251,7 +249,6 @@ def main():
     print("\n>>> 正在处理属性表与导出...")
     fields = [f.name for f in arcpy.ListFields(working_shp) if f.type not in ['Geometry', 'OID']]
 
-    # 检查 CLASS_ID
     if "CLASS_ID" not in fields:
         print("[警告] 在属性表中未找到 'CLASS_ID' 字段。")
 
@@ -328,7 +325,19 @@ def main():
         if arcpy.Exists(working_shp): arcpy.management.Delete(working_shp)
     except:
         pass
-    print("\n所有任务完成！")
+    
+    # 【新增】计算并打印耗时
+    t_end = time.time()
+    end_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(t_end))
+    
+    total_seconds = t_end - t_start
+    hours = int(total_seconds // 3600)
+    minutes = int((total_seconds % 3600) // 60)
+    
+    print(f"\n=======================================================")
+    print(f"任务结束时间: {end_str}")
+    print(f"总耗时: {hours} h : {minutes} m")
+    print(f"=======================================================")
 
 
 if __name__ == "__main__":
