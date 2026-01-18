@@ -1,369 +1,310 @@
-# -*- coding: utf-8 -*-
-# Task4_RandomPoints_Extraction_ControlledDrivers.py
-# 运行环境：ArcGIS Pro Python (arcpy)
-
-import arcpy
-from arcpy.sa import *
-import os
 import pandas as pd
+import numpy as np
+import xgboost as xgb
+import shap
+import matplotlib.pyplot as plt
+import matplotlib
+import matplotlib.patches as mpatches
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import r2_score
+import glob
+import os
+import re
+import gc
+import sys
 import time
 
-# ================= 1. 参数配置区域 =================
+# [cite_start]尝试导入 geoshapley [cite: 5]
+try:
+    import geoshapley
+    from geoshapley import GeoShapleyExplainer
+except ImportError:
+    print("提示: 未检测到 geoshapley，请先安装: pip install geoshapley")
 
-# 工作空间设置
-WORK_DIR = r"E:\paper1"
-arcpy.env.workspace = WORK_DIR
-arcpy.env.overwriteOutput = True
-arcpy.CheckOutExtension("Spatial")
+# 绘图设置
+plt.style.use('seaborn-v0_8-whitegrid')
+fonts = ['SimHei', 'Microsoft YaHei', 'Arial Unicode MS']
+plt.rcParams['font.sans-serif'] = fonts
+plt.rcParams['axes.unicode_minus'] = False
 
-# --- 驱动因子开关 (设置为 True 启用，False 禁用) ---
-DRIVER_SWITCHES = {
-    # 静态因子
-    "USE_DEM": True,
-    "USE_SLOPE": True,
-    "USE_ASPECT": True,
-    "USE_TWI": True,
-    "USE_SOIL_CHINA": True,   # 旧版 China soil
-    "USE_SOIL_HWSD2": True,   # 新版 HWSD2
+# ==========================================
+# 0. 用户配置区 (User Configuration)
+# ==========================================
+INPUT_DIR = r"E:\paper1\excel\point\2"
+OUTPUT_DIR = r"E:\paper1\result\final_plots_styled"
+WETLAND_CODES = [1, 2, 3, 4, 5]
 
-    # 动态因子
-    "USE_LULC": True,
-    "USE_CLIMATE": True,      # 包含 pre, tmp, tmx, tmn, pet, sard, wind, rhum
-    "USE_GDP": True,
-    "USE_POP": True,
-    "USE_NTL": True
+# --- 【核心控制开关】 ---
+CONFIG = {
+    "USE_FULL_DATA": False,
+    "SHAP_SAMPLE_SIZE": 200,
+    "GEOSHAP_SAMPLE_SIZE": 100,
+    # 背景数据保持 50 以防内存溢出
+    "GEOSHAP_BG_SIZE": 5,
+    "EXCLUDE_GEO_IN_IMPORTANCE": True
 }
 
-# --- 输入数据路径 ---
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+print(f"结果将保存至: {OUTPUT_DIR}")
+print(f"当前配置: {CONFIG}")
 
-# 1. LULC 数据
-LULC_DIR = r"E:\paper1\shuju\0LULC\5resmple"
+# ==========================================
+# 1. 获取文件列表
+# ==========================================
+file_pattern = os.path.join(INPUT_DIR, "point_*.csv")
+all_files = glob.glob(file_pattern)
 
-# 2. 动态驱动因子
-CLIMATE_DIR = r"E:\paper1\shuju\1raster_clip\1Dynamic drivers\climate"
-GDP_DIR = r"E:\paper1\shuju\1raster_clip\1Dynamic drivers\GDP"
-POP_DIR = r"E:\paper1\shuju\1raster_clip\1Dynamic drivers\GlobPOP"
-NTL_DIR = r"E:\paper1\shuju\1raster_clip\1Dynamic drivers\NTL"
+if not all_files:
+    raise FileNotFoundError(f"在 {INPUT_DIR} 未找到 point_*.csv 文件。")
 
-# 3. 静态驱动因子
-STATIC_DIR = r"E:\paper1\shuju\1raster_clip\1Static driver"
+print(f"共发现 {len(all_files)} 个年份的数据文件，准备开始分析...")
 
-DEM_PATH = os.path.join(STATIC_DIR, "dem", "Extract_dem_250m.tif")
-SLOPE_ASPECT_DIR = os.path.join(STATIC_DIR, "Slope Aspect")
-SLOPE_PATH = os.path.join(SLOPE_ASPECT_DIR, "Slope.tif")
-ASPECT_PATH = os.path.join(SLOPE_ASPECT_DIR, "Aspect.tif")
-TWI_PATH = os.path.join(SLOPE_ASPECT_DIR, "TWI.sdat")
+# ==========================================
+# 2. 逐年循环分析
+# ==========================================
+for filepath in all_files:
+    gc.collect()
 
-SOIL_CHINA_DIR = os.path.join(STATIC_DIR, "China soil")
-SOIL_HWSD2_DIR = os.path.join(STATIC_DIR, "HWSD2")
+    filename = os.path.basename(filepath)
+    match = re.search(r'\d{4}', filename)
+    year = match.group(0) if match else "UnknownYear"
 
-# 冻土矢量数据路径
-FROZEN_SHP_PATH = r"E:\paper1\shuju\Frozen_soil\Frozen_soil_Ran2012.shp"
+    print(f"\n{'=' * 50}")
+    print(f"正在处理年份: {year}")
+    print(f"{'=' * 50}")
 
-# --- 输出路径 ---
-OUTPUT_SHP_DIR = r"E:\paper1\shuju\shp"
-OUTPUT_POINT_DIR = r"E:\paper1\excel\point\1"
-OUTPUT_WET_DIR = r"E:\paper1\excel\wet\1"
+    # [cite_start]记录每个年份处理的开始时间 [cite: 5]
+    start_time = time.time()
+    formatted_start_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(start_time))
+    print(f"开始时间: {formatted_start_time}")
 
-if not os.path.exists(OUTPUT_SHP_DIR): os.makedirs(OUTPUT_SHP_DIR)
-if not os.path.exists(OUTPUT_POINT_DIR): os.makedirs(OUTPUT_POINT_DIR)
-if not os.path.exists(OUTPUT_WET_DIR): os.makedirs(OUTPUT_WET_DIR)
+    try:
+        # --- 2.1 数据准备 ---
+        data = pd.read_csv(filepath)
+        data = data[data['LULC'] != -9999].copy()
+        data = data.dropna(subset=['LULC', 'Lat', 'Lon'])
 
-# 目标年份
-TARGET_YEARS = [1990, 1995, 2000, 2005, 2010, 2015, 2020]
+        # 构建目标 (0/1)
+        data['Is_Wetland'] = data['LULC'].isin(WETLAND_CODES).astype(int)
+        y = data['Is_Wetland']
 
-# 随机点设置
-NUM_POINTS = 100000
-MIN_DISTANCE = "1 Kilometers"
-VALID_WET_CODES = [1, 2, 3, 4, 5]
+        if y.sum() == 0 or (len(y) - y.sum()) == 0:
+            print(f"[{year}] 样本单一，跳过。")
+            continue
 
+        # 特征筛选
+        ignore_cols = [
+            'PointID', 'CID', 'grid_code', 'Join_Count', 'TARGET_FID',
+            'MERGE1_', 'MERGE1_ID', 'CHINAPERM', 'REGION', 'AREA', 'PERIMETER',
+            'LULC', 'Is_Wetland', 'geom', 'soil_type', 'Year'
+        ]
+        feature_names = [c for c in data.columns if c not in ignore_cols and c not in ['Lat', 'Lon']]
 
-# ================= 2. 辅助函数 =================
+        X = data[feature_names].copy()
+        X = X.fillna(X.mean())
 
-def find_file(directory, keywords, ext=".tif"):
-    """模糊查找文件"""
-    if not os.path.exists(directory): return None
-    for f in os.listdir(directory):
-        if f.endswith(ext) and all(k in f for k in keywords):
-            return os.path.join(directory, f)
-    return None
+        # 标准化
+        scaler = StandardScaler()
+        X_scaled = pd.DataFrame(scaler.fit_transform(X), columns=feature_names)
+        df_features = X_scaled.copy()
 
+        # 拼接坐标
+        df_features['LAT'] = data['Lat'].values
+        df_features['LON'] = data['Lon'].values
 
-def get_year_suffix(year):
-    """生成年份后缀，例如 1990 -> 90"""
-    return str(year)[-2:]
+        # =============================================================================
+        # 3. 训练 XGBoost 模型 (修改为回归模型)
+        # =============================================================================
+        print("\n--- 步骤 2: 正在训练 XGBoost 模型 ---")
 
-
-# ================= 3. 核心流程 =================
-
-def main():
-    t_start = time.time()
-    start_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(t_start))
-    print(f"=======================================================")
-    print(f"任务开始时间: {start_str}")
-    print(f"=======================================================\n")
-
-    print(">>> 开始执行集成提取任务 (可控因子版)...")
-
-    # --- 步骤 1: 生成或加载随机点 ---
-    master_shp = os.path.join(OUTPUT_SHP_DIR, "Master_Sample_Points.shp")
-
-    if not arcpy.Exists(master_shp):
-        print("  正在生成随机点模板 (基于2020年LULC)...")
-        lulc_2020 = os.path.join(LULC_DIR, "2020.tif")
-        if not os.path.exists(lulc_2020):
-            print(f"  [错误] 找不到2020年LULC数据 ({lulc_2020})")
-            return
-
-        temp_poly = os.path.join(OUTPUT_SHP_DIR, "Temp_Valid_Area.shp")
-        ras = Raster(lulc_2020)
-        valid_area = Con(ras > 0, 1)
-        arcpy.conversion.RasterToPolygon(valid_area, temp_poly, "SIMPLIFY", "VALUE")
-
-        print(f"  正在创建 {NUM_POINTS} 个随机点...")
-        arcpy.management.CreateRandomPoints(
-            out_path=OUTPUT_SHP_DIR,
-            out_name="Master_Sample_Points.shp",
-            constraining_feature_class=temp_poly,
-            number_of_points_or_field=NUM_POINTS,
-            minimum_allowed_distance=MIN_DISTANCE
+        # 划分数据集 (根据提供的代码片段修改)
+        X_train, X_test, y_train, y_test = train_test_split(
+            df_features, y,
+            test_size=0.2,
+            random_state=42
         )
-        arcpy.management.Delete(temp_poly)
-        print(f"  随机点已生成: {master_shp}")
-    else:
-        print(f"  使用现有的主点文件: {master_shp}")
 
-    # --- 步骤 2: 冻土数据矢量相交 ---
-    print("\n>>> 处理矢量数据交互 (冻土)...")
-    if not arcpy.Exists(FROZEN_SHP_PATH):
-        print(f"[错误] 找不到冻土矢量文件: {FROZEN_SHP_PATH}")
-        return
-
-    joined_shp = os.path.join(OUTPUT_SHP_DIR, "Temp_Frozen_Joined.shp")
-    if arcpy.Exists(joined_shp): arcpy.management.Delete(joined_shp)
-
-    print("  正在执行空间连接 (Spatial Join)...")
-    try:
-        arcpy.analysis.SpatialJoin(
-            target_features=master_shp,
-            join_features=FROZEN_SHP_PATH,
-            out_feature_class=joined_shp,
-            join_operation="JOIN_ONE_TO_ONE",
-            join_type="KEEP_ALL",
-            match_option="INTERSECT"
+        # [cite_start]初始化 XGBoost 回归器 [cite: 5]
+        model = xgb.XGBRegressor(
+            n_estimators=100,
+            max_depth=5,
+            learning_rate=0.1,
+            objective='reg:squarederror',
+            random_state=42,
+            n_jobs=-1  # 保持多核并行以加快速度
         )
-        print(f"  空间连接完成: {joined_shp}")
-    except Exception as e:
-        print(f"  [空间连接失败] {e}")
-        return
 
-    # --- 步骤 3: 准备工作文件 ---
-    working_shp = os.path.join(OUTPUT_SHP_DIR, "Temp_Process_Points.shp")
-    if arcpy.Exists(working_shp): arcpy.management.Delete(working_shp)
+        # 训练模型
+        model.fit(X_train, y_train)
+        print("模型训练完成。")
 
-    arcpy.management.CopyFeatures(joined_shp, working_shp)
-    arcpy.management.Delete(joined_shp)
+        # 评估 (回归模型使用 R2 score，不能用 Accuracy)
+        score = model.score(X_test, y_test)
+        print(f"[{year}] 模型 R2 Score: {score:.4f}")
 
-    # --- 步骤 4: 构建提取列表 ---
-    extract_list = []
+        # =============================================================================
+        # 4. 特征重要性分析
+        # =============================================================================
+        print(f"[{year}] 绘制特征重要性图...")
 
-    # A. 静态变量 (Static Variables)
-    print("\n>>> 准备静态变量...")
+        importances = model.feature_importances_
+        current_feat_names = X_train.columns.tolist()
+        df_importance = pd.DataFrame({'feature': current_feat_names, 'importance': importances})
 
-    # 1. 地形
-    if DRIVER_SWITCHES["USE_DEM"]:
-        if os.path.exists(DEM_PATH): extract_list.append([DEM_PATH, "DEM"])
-        else: print(f"  [警告] 缺失 DEM: {DEM_PATH}")
-    
-    if DRIVER_SWITCHES["USE_SLOPE"]:
-        if os.path.exists(SLOPE_PATH): extract_list.append([SLOPE_PATH, "Slope"])
-        else: print(f"  [警告] 缺失 Slope: {SLOPE_PATH}")
+        if CONFIG["EXCLUDE_GEO_IN_IMPORTANCE"]:
+            df_importance = df_importance[~df_importance['feature'].isin(['LAT', 'LON'])]
 
-    if DRIVER_SWITCHES["USE_ASPECT"]:
-        if os.path.exists(ASPECT_PATH): extract_list.append([ASPECT_PATH, "Aspect"])
-        else: print(f"  [警告] 缺失 Aspect: {ASPECT_PATH}")
+        df_importance = df_importance.sort_values(by='importance', ascending=True)
 
-    if DRIVER_SWITCHES["USE_TWI"]:
-        if os.path.exists(TWI_PATH): extract_list.append([TWI_PATH, "TWI"])
-        else: print(f"  [警告] 缺失 TWI: {TWI_PATH}")
+        fig, ax = plt.subplots(figsize=(12, 10))
+        df_plot_imp = df_importance.tail(25)
 
-    # 2. 土壤 (China soil - 旧版)
-    if DRIVER_SWITCHES["USE_SOIL_CHINA"]:
-        soil_china_mapping = {
-            "clay1_250m.tif": "clay1", "clay2_250m.tif": "clay2",
-            "geomor_reclass_250m.tif": "geom", "sand1_250m.tif": "sand1",
-            "sand2_250m.tif": "sand2", "soil_type_reclass_gang_250m.tif": "soil_type"
-        }
-        if os.path.exists(SOIL_CHINA_DIR):
-            for filename, col_name in soil_china_mapping.items():
-                file_path = os.path.join(SOIL_CHINA_DIR, filename)
-                if os.path.exists(file_path):
-                    extract_list.append([file_path, col_name])
-                else:
-                    print(f"  [警告] 缺失 China soil 文件: {filename}")
+        bars = ax.barh(df_plot_imp['feature'], df_plot_imp['importance'], color='#d62828')
+        ax.set_title(f'Feature importance values ({year})', fontsize=18, pad=20)
+        ax.set_ylabel('Variable', fontsize=16)
+        ax.tick_params(axis='both', labelsize=12)
+
+        for bar in bars:
+            width = bar.get_width()
+            ax.text(width, bar.get_y() + bar.get_height() / 2, f' {width:.3f}', va='center', fontsize=10)
+        ax.set_xlim(right=ax.get_xlim()[1] * 1.15)
+
+        # Donut Chart
+        donut_features = df_importance['feature'].tail(5).tolist()[::-1]
+        df_donut = df_importance[df_importance['feature'].isin(donut_features)].copy()
+
+        if not df_donut.empty and df_donut['importance'].sum() > 0:
+            df_donut['feature'] = pd.Categorical(df_donut['feature'], categories=donut_features, ordered=True)
+            df_donut = df_donut.sort_values('feature')
+            total_val = df_donut['importance'].sum()
+            percents = df_donut['importance'] / total_val * 100
+
+            ax_inset = fig.add_axes([0.45, 0.15, 0.3, 0.3])
+            colors = matplotlib.colormaps.get('tab10').colors
+            wedges, _ = ax_inset.pie(percents, colors=colors[:len(df_donut)], startangle=90,
+                                     wedgeprops=dict(width=0.45, edgecolor='w'))
+
+            ratio = df_donut['importance'].sum() / df_importance['importance'].sum()
+            ax_inset.text(0, 0, f'Total importance\nof top 5\n{ratio:.2%}', ha='center', va='center', fontsize=9)
+
+            for i, p in enumerate(wedges):
+                ang = (p.theta2 - p.theta1) / 2. + p.theta1
+                y = np.sin(np.deg2rad(ang))
+                x = np.cos(np.deg2rad(ang))
+                if percents.iloc[i] > 0:
+                    ax_inset.annotate(f'{percents.iloc[i]:.1f}%', xy=(x, y), xytext=(1.2 * x, 1.2 * y),
+                                      ha='center', fontsize=10, weight='bold')
+            ax_inset.legend(wedges, df_donut['feature'], loc="center left", bbox_to_anchor=(1, 0.5), frameon=False)
+
+        save_path = os.path.join(OUTPUT_DIR, f"Feature_Importance_{year}.jpg")
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"已保存: {save_path}")
+
+        # =============================================================================
+        # 5. SHAP 分析
+        # =============================================================================
+        print(f"[{year}] SHAP 分析...")
+        explainer = shap.TreeExplainer(model)
+
+        if CONFIG["USE_FULL_DATA"]:
+            X_shap = df_features
+            print(f"  使用全量数据 ({len(X_shap)} 行)...")
         else:
-            print(f"  [警告] China soil 文件夹不存在: {SOIL_CHINA_DIR}")
+            sample_n = min(CONFIG["SHAP_SAMPLE_SIZE"], len(df_features))
+            X_shap = df_features.sample(sample_n, random_state=42)
+            print(f"  使用抽样数据 ({len(X_shap)} 行)...")
 
-    # 3. 土壤 (HWSD2 - 新增)
-    if DRIVER_SWITCHES["USE_SOIL_HWSD2"]:
-        if os.path.exists(SOIL_HWSD2_DIR):
-            for f in os.listdir(SOIL_HWSD2_DIR):
-                if f.endswith(".tif") and "TP_Final" in f:
-                    file_path = os.path.join(SOIL_HWSD2_DIR, f)
-                    parts = f.replace(".tif", "").split("_")
-                    if len(parts) >= 4:
-                        col_name = "_".join(parts[2:]).lower()
-                    else:
-                        col_name = f.replace(".tif", "")[-10:]
-                    extract_list.append([file_path, col_name])
-        else:
-            print(f"  [警告] HWSD2 文件夹不存在: {SOIL_HWSD2_DIR}")
+        shap_values = explainer(X_shap)
 
-    # B. 动态年份变量 (Dynamic Variables)
-    print("\n>>> 准备动态年份变量...")
+        cols = X_shap.columns
+        non_geo_cols = [c for c in cols if c not in ['LAT', 'LON']]
 
-    for year in TARGET_YEARS:
-        ys = get_year_suffix(year)
+        plt.figure(figsize=(10, 8))
+        shap.summary_plot(shap_values[:, non_geo_cols], X_shap[non_geo_cols],
+                          plot_type="dot", cmap="RdYlBu", show=False)
+        plt.title(f"SHAP Feature Importance Summary ({year})", fontsize=16)
+        plt.savefig(os.path.join(OUTPUT_DIR, f"SHAP_Summary_{year}.jpg"), dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"已保存: SHAP_Summary_{year}.jpg")
 
-        # 1. LULC
-        if DRIVER_SWITCHES["USE_LULC"]:
-            p = os.path.join(LULC_DIR, f"{year}.tif")
-            if os.path.exists(p): extract_list.append([p, f"LULC_{ys}"])
-            else: print(f"  [警告] 缺失 LULC {year}")
+        # =============================================================================
+        # 6. GeoShapley 分析
+        # =============================================================================
+        print(f"[{year}] GeoShapley 分析 (全量模式，可能较慢，请耐心等待)...")
 
-        # 2. Climate (Updated with sard, wind, rhum)
-        if DRIVER_SWITCHES["USE_CLIMATE"]:
-            # 添加了 sard, wind, rhum
-            clim_vars = ["pet", "pre", "tmp", "tmx", "tmn", "sard", "wind", "rhum"]
-            for var in clim_vars:
-                var_dir = os.path.join(CLIMATE_DIR, var)
-                p = find_file(var_dir, [str(year)])
-                if not p: p = find_file(CLIMATE_DIR, [var, str(year)])
-                
-                if p:
-                    extract_list.append([p, f"{var}_{ys}"])
-                else:
-                    print(f"  [警告] 缺失气候数据 {var} {year}")
+        bg_size = CONFIG["GEOSHAP_BG_SIZE"]
+        bg_data = X_train.sample(min(bg_size, len(X_train)), random_state=42)
 
-        # 3. GDP
-        if DRIVER_SWITCHES["USE_GDP"]:
-            p = find_file(GDP_DIR, ["Total", str(year)])
-            if p: extract_list.append([p, f"GDPT_{ys}"])
-            
-            p = find_file(GDP_DIR, ["PerCapita", str(year)])
-            if p: extract_list.append([p, f"GDPP_{ys}"])
+        geoshap_explainer = GeoShapleyExplainer(model.predict, bg_data)
 
-        # 4. POP
-        if DRIVER_SWITCHES["USE_POP"]:
-            p = find_file(POP_DIR, ["Count", str(year)])
-            if p: extract_list.append([p, f"POPC_{ys}"])
-            
-            p = find_file(POP_DIR, ["Density", str(year)])
-            if p: extract_list.append([p, f"POPD_{ys}"])
-        
-        # 5. NTL
-        if DRIVER_SWITCHES["USE_NTL"]:
-            p = find_file(NTL_DIR, ["NTL", str(year)])
-            if p: extract_list.append([p, f"NTL_{ys}"])
-            else: print(f"  [警告] 缺失夜光遥感数据 NTL {year}")
+        try:
+            if CONFIG["USE_FULL_DATA"]:
+                data_to_explain = df_features
+                print(f"  正在解释全量数据 ({len(data_to_explain)} 行)...")
+            else:
+                sample_n = min(CONFIG["GEOSHAP_SAMPLE_SIZE"], len(df_features))
+                data_to_explain = df_features.sample(sample_n, random_state=42)
+                print(f"  正在解释抽样数据 ({len(data_to_explain)} 行)...")
 
-    # --- 步骤 5: 执行提取 ---
-    print(f"  正在将 {len(extract_list)} 个栅格变量提取到 Shapefile...")
-    try:
-        arcpy.sa.ExtractMultiValuesToPoints(working_shp, extract_list, "NONE")
-        print("  栅格提取完成！")
+            # CPU模式，多核并行
+            geoshapley_results = geoshap_explainer.explain(data_to_explain, n_jobs=-1)
+
+            # --- 发散条形图 ---
+            print(f"[{year}] 绘制 GeoShapley Diverging Bar...")
+            non_spatial_feats = [f for f in current_feat_names if f not in ['LAT', 'LON']]
+
+            mean_primary = pd.Series(geoshapley_results.primary.mean(axis=0), index=non_spatial_feats)
+            mean_interaction = pd.Series(geoshapley_results.geo_intera.mean(axis=0),
+                                         index=[f'{f} x GEO' for f in non_spatial_feats])
+            mean_spatial = pd.Series(geoshapley_results.geo.mean(), index=['GEO'])
+
+            df_plot = pd.concat([mean_primary, mean_interaction, mean_spatial]).reset_index()
+            df_plot.columns = ['Variable', 'Value']
+
+            df_plot['AbsValue'] = df_plot['Value'].abs()
+            df_plot_top = df_plot.sort_values('AbsValue', ascending=False).head(15).sort_values('Value', ascending=True)
+            df_plot_top['Color'] = ['#e69f00' if x >= 0 else '#0072b2' for x in df_plot_top['Value']]
+
+            fig3, ax3 = plt.subplots(figsize=(10, 8))
+            ax3.barh(df_plot_top['Variable'], df_plot_top['Value'], color=df_plot_top['Color'])
+
+            for _, row in df_plot_top.iterrows():
+                val = row['Value']
+                offset = max(df_plot_top['AbsValue']) * 0.02 * (1 if val > 0 else -1)
+                ax3.text(val + offset, row['Variable'], f'{val:.3f}', ha='left' if val > 0 else 'right', va='center',
+                         fontsize=9)
+
+            ax3.axvline(0, color='black', lw=0.8)
+            ax3.set_title(f'Geoshapley values for XGB ({year})', fontsize=16)
+            ax3.set_xlim(-df_plot_top['AbsValue'].max() * 1.3, df_plot_top['AbsValue'].max() * 1.3)
+            plt.savefig(os.path.join(OUTPUT_DIR, f"GeoShapley_DivergingBar_{year}.jpg"), dpi=300, bbox_inches='tight')
+            plt.close()
+
+            # Beeswarm
+            print(f"[{year}] 绘制 GeoShapley Beeswarm...")
+            plt.figure(figsize=(10, 8))
+            geoshapley_results.summary_plot(include_interaction=True, cmap='RdYlBu')
+            plt.title(f"GeoShapley Value Summary Plot ({year})", fontsize=16)
+            plt.savefig(os.path.join(OUTPUT_DIR, f"GeoShapley_Beeswarm_{year}.jpg"), dpi=300, bbox_inches='tight')
+            plt.close()
+
+        except Exception as e:
+            print(f"[{year}] GeoShapley 计算失败: {e}")
+            import traceback
+
+            traceback.print_exc()
+
+        # [cite_start]打印耗时 [cite: 5]
+        elapsed_seconds = time.time() - start_time
+        elapsed_minutes = elapsed_seconds / 60
+        elapsed_hours = elapsed_seconds / 3600
+        print(f"[{year}] 处理完成，耗时: {elapsed_seconds:.2f} 秒 ({elapsed_minutes:.2f} 分钟)")
+
     except Exception as e:
-        print(f"  [提取失败] 错误详情: {e}")
-        return
+        print(f"处理年份 {year} 时出错: {e}")
+        continue
 
-    # --- 步骤 6: 转换为 DataFrame 并清洗 ---
-    print("\n>>> 正在处理属性表与导出...")
-    fields = [f.name for f in arcpy.ListFields(working_shp) if f.type not in ['Geometry', 'OID']]
-
-    data_rows = []
-    with arcpy.da.SearchCursor(working_shp, ["OID@", "SHAPE@X", "SHAPE@Y"] + fields) as cursor:
-        for row in cursor:
-            data_rows.append(row)
-
-    master_df = pd.DataFrame(data_rows, columns=["PointID", "Lon", "Lat"] + fields)
-
-    print(f"  初始点数: {len(master_df)}")
-    master_df.dropna(inplace=True)
-    print(f"  清洗后点数: {len(master_df)}")
-
-    if len(master_df) == 0:
-        print("[错误] 所有点都被剔除了！")
-        return
-
-    # --- 步骤 7: 逐年拆分并导出 ---
-    static_cols = ["PointID", "Lon", "Lat"]
-    frozen_col = "CLASS_ID"
-    if frozen_col in fields: static_cols.append(frozen_col)
-
-    for col in fields:
-        is_dynamic = False
-        for yr in TARGET_YEARS:
-            if col.endswith(f"_{get_year_suffix(yr)}"):
-                is_dynamic = True
-                break
-        if not is_dynamic and col not in static_cols:
-            static_cols.append(col)
-
-    for year in TARGET_YEARS:
-        ys = get_year_suffix(year)
-        print(f"\n>>> 导出年份 {year} ...")
-
-        current_cols = static_cols.copy()
-        rename_dict = {}
-
-        if frozen_col in master_df.columns: rename_dict[frozen_col] = "Frozen"
-
-        year_dynamic_cols = []
-        for col in fields:
-            if col.endswith(f"_{ys}"):
-                year_dynamic_cols.append(col)
-                base_name = col[:-3]
-                if base_name == "GDPT": new_name = "GDP_T"
-                elif base_name == "GDPP": new_name = "GDP_P"
-                elif base_name == "POPC": new_name = "POP_C"
-                elif base_name == "POPD": new_name = "POP_D"
-                else: new_name = base_name
-                rename_dict[col] = new_name
-
-        df_year = master_df[current_cols + year_dynamic_cols].copy()
-        df_year.rename(columns=rename_dict, inplace=True)
-        df_year["Year"] = year
-
-        # 导出 point csv
-        p_out = os.path.join(OUTPUT_POINT_DIR, f"point_{year}.csv")
-        df_year.to_csv(p_out, index=False, encoding='utf-8-sig')
-        print(f"  [1] point_{year}.csv 已保存")
-
-        # 导出 wet csv
-        if "LULC" in df_year.columns:
-            df_wet = df_year[df_year["LULC"].isin(VALID_WET_CODES)]
-            w_out = os.path.join(OUTPUT_WET_DIR, f"wet_{year}.csv")
-            df_wet.to_csv(w_out, index=False, encoding='utf-8-sig')
-            print(f"  [2] wet_{year}.csv   已保存")
-
-    # 清理临时文件
-    try:
-        if arcpy.Exists(working_shp): arcpy.management.Delete(working_shp)
-    except:
-        pass
-
-    # 计算耗时
-    t_end = time.time()
-    end_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(t_end))
-    total_seconds = t_end - t_start
-    hours = int(total_seconds // 3600)
-    minutes = int((total_seconds % 3600) // 60)
-
-    print(f"\n=======================================================")
-    print(f"任务结束时间: {end_str}")
-    print(f"总耗时: {hours} h : {minutes} m")
-    print(f"=======================================================")
-
-
-if __name__ == "__main__":
-    main()
+print(f"\n{'=' * 50}")
+print(f"所有任务完成！")
