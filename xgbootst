@@ -7,13 +7,13 @@ import matplotlib
 import matplotlib.patches as mpatches
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import accuracy_score
+from sklearn.metrics import r2_score  # 引入 R2 用于回归评估
 import glob
 import os
 import re
 import gc
 import sys
-import time  # 引入时间模块以监控进度
+import time
 
 # 尝试导入 geoshapley
 try:
@@ -37,19 +37,11 @@ WETLAND_CODES = [1, 2, 3, 4, 5]
 
 # --- 【核心控制开关】 ---
 CONFIG = {
-    # 1. 是否使用全量数据进行解释？
-    # 【已开启】使用全量数据
     "USE_FULL_DATA": False,
-
-    # 2. 样本量配置 (仅当 USE_FULL_DATA=False 时生效，全量模式下忽略 SHAP/GEOSHAP_SAMPLE_SIZE)
     "SHAP_SAMPLE_SIZE": 8000,
     "GEOSHAP_SAMPLE_SIZE": 5000,
-
-    # 【核心安全锁】GeoShapley 背景数据集大小
-    # 保持为 50，这是全量数据能跑通的关键！千万不要改回 1000。
+    # 背景数据保持 50 以防内存溢出
     "GEOSHAP_BG_SIZE": 50,
-
-    # 3. 特征重要性图中是否剔除经纬度？
     "EXCLUDE_GEO_IN_IMPORTANCE": True
 }
 
@@ -72,7 +64,7 @@ print(f"共发现 {len(all_files)} 个年份的数据文件，准备开始分析
 # 2. 逐年循环分析
 # ==========================================
 for filepath in all_files:
-    gc.collect()  # 强制回收内存
+    gc.collect()
 
     filename = os.path.basename(filepath)
     match = re.search(r'\d{4}', filename)
@@ -82,7 +74,7 @@ for filepath in all_files:
     print(f"正在处理年份: {year}")
     print(f"{'=' * 50}")
 
-    start_time = time.time()  # 计时开始
+    start_time = time.time()
 
     try:
         # --- 2.1 数据准备 ---
@@ -90,7 +82,7 @@ for filepath in all_files:
         data = data[data['LULC'] != -9999].copy()
         data = data.dropna(subset=['LULC', 'Lat', 'Lon'])
 
-        # 构建目标
+        # 构建目标 (0/1)
         data['Is_Wetland'] = data['LULC'].isin(WETLAND_CODES).astype(int)
         y = data['Is_Wetland']
 
@@ -114,37 +106,47 @@ for filepath in all_files:
         X_scaled = pd.DataFrame(scaler.fit_transform(X), columns=feature_names)
         df_features = X_scaled.copy()
 
-        # 拼接坐标 (必须在最后)
+        # 拼接坐标
         df_features['LAT'] = data['Lat'].values
         df_features['LON'] = data['Lon'].values
 
-        # 划分训练集
-        X_train, X_test, y_train, y_test = train_test_split(df_features, y, test_size=0.3, random_state=42, stratify=y)
-
-        print(f"  数据加载完毕: 总行数 {len(df_features)}")
-
-        # --- 2.2 模型训练 (CPU) ---
-        scale_pos_weight = (len(y) - y.sum()) / y.sum()
-        model = xgb.XGBClassifier(
-            n_estimators=300,
-            learning_rate=0.1,
-            max_depth=6,
-            scale_pos_weight=scale_pos_weight,
-            random_state=42,
-            n_jobs=-1,  # 使用所有 CPU 核心加速训练
-            eval_metric='logloss'
+        # =============================================================================
+        # 3. 训练 XGBoost 模型 (修改为回归模型)
+        # =============================================================================
+        print("\n--- 步骤 2: 正在训练 XGBoost 模型 ---")
+        
+        # 划分数据集 (根据提供的代码片段修改)
+        X_train, X_test, y_train, y_test = train_test_split(
+            df_features, y, 
+            test_size=0.2, 
+            random_state=42
         )
+
+        # 初始化 XGBoost 回归器
+        model = xgb.XGBRegressor(
+            n_estimators=100,
+            max_depth=5,
+            learning_rate=0.1,
+            objective='reg:squarederror',
+            random_state=42,
+            n_jobs=-1 # 保持多核并行以加快速度
+        )
+
+        # 训练模型
         model.fit(X_train, y_train)
-        print(f"[{year}] 模型精度: {accuracy_score(y_test, model.predict(X_test)):.4f}")
+        print("模型训练完成。")
+        
+        # 评估 (回归模型使用 R2 score，不能用 Accuracy)
+        score = model.score(X_test, y_test)
+        print(f"[{year}] 模型 R2 Score: {score:.4f}")
 
         # =============================================================================
-        # 4. 特征重要性分析 (Bar + Donut)
+        # 4. 特征重要性分析
         # =============================================================================
         print(f"[{year}] 绘制特征重要性图...")
 
         importances = model.feature_importances_
         current_feat_names = X_train.columns.tolist()
-
         df_importance = pd.DataFrame({'feature': current_feat_names, 'importance': importances})
 
         if CONFIG["EXCLUDE_GEO_IN_IMPORTANCE"]:
@@ -152,7 +154,6 @@ for filepath in all_files:
 
         df_importance = df_importance.sort_values(by='importance', ascending=True)
 
-        # 绘图逻辑
         fig, ax = plt.subplots(figsize=(12, 10))
         df_plot_imp = df_importance.tail(25)
 
@@ -199,10 +200,9 @@ for filepath in all_files:
         print(f"已保存: {save_path}")
 
         # =============================================================================
-        # 5. SHAP 分析 (CPU)
+        # 5. SHAP 分析
         # =============================================================================
         print(f"[{year}] SHAP 分析...")
-        # CPU 版本的 TreeExplainer 对 XGBoost 优化得非常好，全量数据通常也能在几分钟内跑完
         explainer = shap.TreeExplainer(model)
 
         if CONFIG["USE_FULL_DATA"]:
@@ -227,29 +227,25 @@ for filepath in all_files:
         print(f"已保存: SHAP_Summary_{year}.jpg")
 
         # =============================================================================
-        # 6. GeoShapley 分析 (CPU)
+        # 6. GeoShapley 分析
         # =============================================================================
         print(f"[{year}] GeoShapley 分析 (全量模式，可能较慢，请耐心等待)...")
 
-        # 【核心配置】背景数据 50 个
         bg_size = CONFIG["GEOSHAP_BG_SIZE"]
         bg_data = X_train.sample(min(bg_size, len(X_train)), random_state=42)
-
+        
         geoshap_explainer = GeoShapleyExplainer(model.predict, bg_data)
 
         try:
             if CONFIG["USE_FULL_DATA"]:
                 data_to_explain = df_features
                 print(f"  正在解释全量数据 ({len(data_to_explain)} 行)...")
-                # 估算内存占用：130000行 * 50背景 * 20特征 * 8字节 ≈ 1GB
-                # 您的电脑完全可以承受，主要瓶颈是 CPU 计算时间
             else:
                 sample_n = min(CONFIG["GEOSHAP_SAMPLE_SIZE"], len(df_features))
                 data_to_explain = df_features.sample(sample_n, random_state=42)
                 print(f"  正在解释抽样数据 ({len(data_to_explain)} 行)...")
 
-            # 在 CPU 模式下使用 n_jobs=-1 拉满 CPU 核心
-            # 由于 bg_size 只有 50，内存不会溢出
+            # CPU模式，多核并行
             geoshapley_results = geoshap_explainer.explain(data_to_explain, n_jobs=-1)
 
             # --- 发散条形图 ---
@@ -294,7 +290,6 @@ for filepath in all_files:
         except Exception as e:
             print(f"[{year}] GeoShapley 计算失败: {e}")
             import traceback
-
             traceback.print_exc()
 
         # 打印耗时
