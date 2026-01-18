@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# Task4_RandomPoints_Extraction_UpdatedPaths_v2.py
+# Task4_RandomPoints_Extraction_ControlledDrivers.py
 # 运行环境：ArcGIS Pro Python (arcpy)
 
 import arcpy
@@ -16,36 +16,45 @@ arcpy.env.workspace = WORK_DIR
 arcpy.env.overwriteOutput = True
 arcpy.CheckOutExtension("Spatial")
 
-# --- 输入数据路径 (基于提供的目录结构更新) ---
+# --- 驱动因子开关 (设置为 True 启用，False 禁用) ---
+DRIVER_SWITCHES = {
+    # 静态因子
+    "USE_DEM": True,
+    "USE_SLOPE": True,
+    "USE_ASPECT": True,
+    "USE_TWI": True,
+    "USE_SOIL_CHINA": True,   # 旧版 China soil
+    "USE_SOIL_HWSD2": True,   # 新版 HWSD2
 
-# 1. LULC 数据 (使用 5resmple 文件夹)
+    # 动态因子
+    "USE_LULC": True,
+    "USE_CLIMATE": True,      # 包含 pre, tmp, tmx, tmn, pet, sard, wind, rhum
+    "USE_GDP": True,
+    "USE_POP": True,
+    "USE_NTL": True
+}
+
+# --- 输入数据路径 ---
+
+# 1. LULC 数据
 LULC_DIR = r"E:\paper1\shuju\0LULC\5resmple"
 
-# 2. 动态驱动因子 (Dynamic drivers)
-# 气候数据
+# 2. 动态驱动因子
 CLIMATE_DIR = r"E:\paper1\shuju\1raster_clip\1Dynamic drivers\climate"
-# GDP 数据
 GDP_DIR = r"E:\paper1\shuju\1raster_clip\1Dynamic drivers\GDP"
-# 人口数据
 POP_DIR = r"E:\paper1\shuju\1raster_clip\1Dynamic drivers\GlobPOP"
-# 夜光遥感数据 (新增)
 NTL_DIR = r"E:\paper1\shuju\1raster_clip\1Dynamic drivers\NTL"
 
-
-# 3. 静态驱动因子 (Static driver)
+# 3. 静态驱动因子
 STATIC_DIR = r"E:\paper1\shuju\1raster_clip\1Static driver"
 
-# 地形相关
 DEM_PATH = os.path.join(STATIC_DIR, "dem", "Extract_dem_250m.tif")
 SLOPE_ASPECT_DIR = os.path.join(STATIC_DIR, "Slope Aspect")
 SLOPE_PATH = os.path.join(SLOPE_ASPECT_DIR, "Slope.tif")
 ASPECT_PATH = os.path.join(SLOPE_ASPECT_DIR, "Aspect.tif")
 TWI_PATH = os.path.join(SLOPE_ASPECT_DIR, "TWI.sdat")
 
-# 土壤数据 (China soil - 旧版)
 SOIL_CHINA_DIR = os.path.join(STATIC_DIR, "China soil")
-
-# 土壤数据 (HWSD2 - 新增)
 SOIL_HWSD2_DIR = os.path.join(STATIC_DIR, "HWSD2")
 
 # 冻土矢量数据路径
@@ -88,14 +97,13 @@ def get_year_suffix(year):
 # ================= 3. 核心流程 =================
 
 def main():
-    # 记录开始时间
     t_start = time.time()
     start_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(t_start))
     print(f"=======================================================")
     print(f"任务开始时间: {start_str}")
     print(f"=======================================================\n")
 
-    print(">>> 开始执行集成提取任务 (更新路径 v2)...")
+    print(">>> 开始执行集成提取任务 (可控因子版)...")
 
     # --- 步骤 1: 生成或加载随机点 ---
     master_shp = os.path.join(OUTPUT_SHP_DIR, "Master_Sample_Points.shp")
@@ -163,64 +171,53 @@ def main():
     print("\n>>> 准备静态变量...")
 
     # 1. 地形
-    if os.path.exists(DEM_PATH):
-        extract_list.append([DEM_PATH, "DEM"])
-    else:
-        print(f"  [警告] 缺失 DEM: {DEM_PATH}")
+    if DRIVER_SWITCHES["USE_DEM"]:
+        if os.path.exists(DEM_PATH): extract_list.append([DEM_PATH, "DEM"])
+        else: print(f"  [警告] 缺失 DEM: {DEM_PATH}")
+    
+    if DRIVER_SWITCHES["USE_SLOPE"]:
+        if os.path.exists(SLOPE_PATH): extract_list.append([SLOPE_PATH, "Slope"])
+        else: print(f"  [警告] 缺失 Slope: {SLOPE_PATH}")
 
-    if os.path.exists(SLOPE_PATH):
-        extract_list.append([SLOPE_PATH, "Slope"])
-    else:
-        print(f"  [警告] 缺失 Slope: {SLOPE_PATH}")
+    if DRIVER_SWITCHES["USE_ASPECT"]:
+        if os.path.exists(ASPECT_PATH): extract_list.append([ASPECT_PATH, "Aspect"])
+        else: print(f"  [警告] 缺失 Aspect: {ASPECT_PATH}")
 
-    if os.path.exists(ASPECT_PATH):
-        extract_list.append([ASPECT_PATH, "Aspect"])
-    else:
-        print(f"  [警告] 缺失 Aspect: {ASPECT_PATH}")
-
-    if os.path.exists(TWI_PATH):
-        extract_list.append([TWI_PATH, "TWI"])
-    else:
-        print(f"  [警告] 缺失 TWI: {TWI_PATH}")
+    if DRIVER_SWITCHES["USE_TWI"]:
+        if os.path.exists(TWI_PATH): extract_list.append([TWI_PATH, "TWI"])
+        else: print(f"  [警告] 缺失 TWI: {TWI_PATH}")
 
     # 2. 土壤 (China soil - 旧版)
-    # 根据目录树，主要保留 _250m.tif 结尾的文件
-    soil_china_mapping = {
-        "clay1_250m.tif": "clay1",
-        "clay2_250m.tif": "clay2",
-        "geomor_reclass_250m.tif": "geom",
-        "sand1_250m.tif": "sand1",
-        "sand2_250m.tif": "sand2",
-        "soil_type_reclass_gang_250m.tif": "soil_type"
-    }
-    if os.path.exists(SOIL_CHINA_DIR):
-        for filename, col_name in soil_china_mapping.items():
-            file_path = os.path.join(SOIL_CHINA_DIR, filename)
-            if os.path.exists(file_path):
-                extract_list.append([file_path, col_name])
-            else:
-                print(f"  [警告] 缺失 China soil 文件: {filename}")
-    else:
-        print(f"  [警告] China soil 文件夹不存在: {SOIL_CHINA_DIR}")
+    if DRIVER_SWITCHES["USE_SOIL_CHINA"]:
+        soil_china_mapping = {
+            "clay1_250m.tif": "clay1", "clay2_250m.tif": "clay2",
+            "geomor_reclass_250m.tif": "geom", "sand1_250m.tif": "sand1",
+            "sand2_250m.tif": "sand2", "soil_type_reclass_gang_250m.tif": "soil_type"
+        }
+        if os.path.exists(SOIL_CHINA_DIR):
+            for filename, col_name in soil_china_mapping.items():
+                file_path = os.path.join(SOIL_CHINA_DIR, filename)
+                if os.path.exists(file_path):
+                    extract_list.append([file_path, col_name])
+                else:
+                    print(f"  [警告] 缺失 China soil 文件: {filename}")
+        else:
+            print(f"  [警告] China soil 文件夹不存在: {SOIL_CHINA_DIR}")
 
     # 3. 土壤 (HWSD2 - 新增)
-    # 根据目录树，添加 HWSD2 下的所有 .tif 文件
-    # 字段名简化：TP_Final_D1_BULK.tif -> D1_BULK
-    if os.path.exists(SOIL_HWSD2_DIR):
-        for f in os.listdir(SOIL_HWSD2_DIR):
-            if f.endswith(".tif") and "TP_Final" in f:
-                file_path = os.path.join(SOIL_HWSD2_DIR, f)
-                # 提取简化列名：TP_Final_D1_BULK -> D1_BULK
-                # 假设文件名格式固定为 TP_Final_XX_YY.tif
-                parts = f.replace(".tif", "").split("_")
-                if len(parts) >= 4:
-                    col_name = "_".join(parts[2:]).lower() # e.g., d1_bulk
-                else:
-                    col_name = f.replace(".tif", "")[-10:] # 备用缩写
-                
-                extract_list.append([file_path, col_name])
-    else:
-        print(f"  [警告] HWSD2 文件夹不存在: {SOIL_HWSD2_DIR}")
+    if DRIVER_SWITCHES["USE_SOIL_HWSD2"]:
+        if os.path.exists(SOIL_HWSD2_DIR):
+            for f in os.listdir(SOIL_HWSD2_DIR):
+                if f.endswith(".tif") and "TP_Final" in f:
+                    file_path = os.path.join(SOIL_HWSD2_DIR, f)
+                    parts = f.replace(".tif", "").split("_")
+                    if len(parts) >= 4:
+                        col_name = "_".join(parts[2:]).lower()
+                    else:
+                        col_name = f.replace(".tif", "")[-10:]
+                    extract_list.append([file_path, col_name])
+        else:
+            print(f"  [警告] HWSD2 文件夹不存在: {SOIL_HWSD2_DIR}")
 
     # B. 动态年份变量 (Dynamic Variables)
     print("\n>>> 准备动态年份变量...")
@@ -229,41 +226,46 @@ def main():
         ys = get_year_suffix(year)
 
         # 1. LULC
-        p = os.path.join(LULC_DIR, f"{year}.tif")
-        if os.path.exists(p):
-            extract_list.append([p, f"LULC_{ys}"])
-        else:
-            print(f"  [警告] 缺失 LULC {year}")
+        if DRIVER_SWITCHES["USE_LULC"]:
+            p = os.path.join(LULC_DIR, f"{year}.tif")
+            if os.path.exists(p): extract_list.append([p, f"LULC_{ys}"])
+            else: print(f"  [警告] 缺失 LULC {year}")
 
-        # 2. Climate
-        for var in ["pet", "pre", "tmp", "tmx", "tmn"]:
-            var_dir = os.path.join(CLIMATE_DIR, var)
-            p = find_file(var_dir, [str(year)])
-            if not p: p = find_file(CLIMATE_DIR, [var, str(year)])
-            
-            if p:
-                extract_list.append([p, f"{var}_{ys}"])
-            else:
-                print(f"  [警告] 缺失气候数据 {var} {year}")
+        # 2. Climate (Updated with sard, wind, rhum)
+        if DRIVER_SWITCHES["USE_CLIMATE"]:
+            # 添加了 sard, wind, rhum
+            clim_vars = ["pet", "pre", "tmp", "tmx", "tmn", "sard", "wind", "rhum"]
+            for var in clim_vars:
+                var_dir = os.path.join(CLIMATE_DIR, var)
+                p = find_file(var_dir, [str(year)])
+                if not p: p = find_file(CLIMATE_DIR, [var, str(year)])
+                
+                if p:
+                    extract_list.append([p, f"{var}_{ys}"])
+                else:
+                    print(f"  [警告] 缺失气候数据 {var} {year}")
 
         # 3. GDP
-        p = find_file(GDP_DIR, ["Total", str(year)])
-        if p: extract_list.append([p, f"GDPT_{ys}"])
-        
-        p = find_file(GDP_DIR, ["PerCapita", str(year)])
-        if p: extract_list.append([p, f"GDPP_{ys}"])
+        if DRIVER_SWITCHES["USE_GDP"]:
+            p = find_file(GDP_DIR, ["Total", str(year)])
+            if p: extract_list.append([p, f"GDPT_{ys}"])
+            
+            p = find_file(GDP_DIR, ["PerCapita", str(year)])
+            if p: extract_list.append([p, f"GDPP_{ys}"])
 
         # 4. POP
-        p = find_file(POP_DIR, ["Count", str(year)])
-        if p: extract_list.append([p, f"POPC_{ys}"])
+        if DRIVER_SWITCHES["USE_POP"]:
+            p = find_file(POP_DIR, ["Count", str(year)])
+            if p: extract_list.append([p, f"POPC_{ys}"])
+            
+            p = find_file(POP_DIR, ["Density", str(year)])
+            if p: extract_list.append([p, f"POPD_{ys}"])
         
-        p = find_file(POP_DIR, ["Density", str(year)])
-        if p: extract_list.append([p, f"POPD_{ys}"])
-        
-        # 5. NTL (新增)
-        p = find_file(NTL_DIR, ["NTL", str(year)])
-        if p: extract_list.append([p, f"NTL_{ys}"])
-        else: print(f"  [警告] 缺失夜光遥感数据 NTL {year}")
+        # 5. NTL
+        if DRIVER_SWITCHES["USE_NTL"]:
+            p = find_file(NTL_DIR, ["NTL", str(year)])
+            if p: extract_list.append([p, f"NTL_{ys}"])
+            else: print(f"  [警告] 缺失夜光遥感数据 NTL {year}")
 
     # --- 步骤 5: 执行提取 ---
     print(f"  正在将 {len(extract_list)} 个栅格变量提取到 Shapefile...")
@@ -298,7 +300,6 @@ def main():
     frozen_col = "CLASS_ID"
     if frozen_col in fields: static_cols.append(frozen_col)
 
-    # 自动识别其他静态列（如土壤、地形）
     for col in fields:
         is_dynamic = False
         for yr in TARGET_YEARS:
@@ -321,14 +322,11 @@ def main():
         for col in fields:
             if col.endswith(f"_{ys}"):
                 year_dynamic_cols.append(col)
-                # 动态变量重命名
                 base_name = col[:-3]
                 if base_name == "GDPT": new_name = "GDP_T"
                 elif base_name == "GDPP": new_name = "GDP_P"
                 elif base_name == "POPC": new_name = "POP_C"
                 elif base_name == "POPD": new_name = "POP_D"
-                # NTL 不需要特殊重命名，保持 NTL_90 即可，或者去掉年份
-                # 这里如果只想要 NTL，可以: elif base_name == "NTL": new_name = "NTL"
                 else: new_name = base_name
                 rename_dict[col] = new_name
 
