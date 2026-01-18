@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# Task4_RandomPoints_Extraction_Integrated_V7_FrozenVector.py
+# Task4_RandomPoints_Extraction_UpdatedPaths.py
 # 运行环境：ArcGIS Pro Python (arcpy)
 
 import arcpy
@@ -15,26 +15,36 @@ arcpy.env.workspace = WORK_DIR
 arcpy.env.overwriteOutput = True
 arcpy.CheckOutExtension("Spatial")
 
-# --- 输入数据路径 ---
-LULC_DIR = r"E:\paper1\shuju\LULC\5resmple"
-CLIMATE_DIR = r"Z:\datasat\0000A\zhujx\raster\qixiangshuju\qihou2"
+# --- 输入数据路径 (基于提供的目录结构更新) ---
 
-# 地形相关
-DEM_PATH = r"E:\paper1\shuju\dem\Extract_dem_250m.tif"
-# 【修改】明确指定 Slope 和 Aspect 的文件路径
-SLOPE_PATH = r"E:\paper1\shuju\Slope Aspect\Slope.tif"
-ASPECT_PATH = r"E:\paper1\shuju\Slope Aspect\Aspect.tif"
-TWI_PATH = r"E:\paper1\shuju\Slope Aspect\TWI.sdat"
+# 1. LULC 数据 (使用 5resmple 文件夹) 
+LULC_DIR = r"E:\paper1\shuju\0LULC\5resmple"
 
-# 【新增】冻土矢量数据路径
+# 2. 动态驱动因子 (Dynamic drivers) 
+# 气候数据
+CLIMATE_DIR = r"E:\paper1\shuju\1raster_clip\1Dynamic drivers\climate"
+# GDP 数据
+GDP_DIR = r"E:\paper1\shuju\1raster_clip\1Dynamic drivers\GDP"
+# 人口数据
+POP_DIR = r"E:\paper1\shuju\1raster_clip\1Dynamic drivers\GlobPOP"
+
+# 3. 静态驱动因子 (Static driver) 
+STATIC_DIR = r"E:\paper1\shuju\1raster_clip\1Static driver"
+
+# 地形相关 (DEM, Slope, Aspect, TWI)
+# DEM 使用 Extract_dem_250m.tif 
+DEM_PATH = os.path.join(STATIC_DIR, "dem", "Extract_dem_250m.tif")
+# Slope 和 Aspect 
+SLOPE_ASPECT_DIR = os.path.join(STATIC_DIR, "Slope Aspect")
+SLOPE_PATH = os.path.join(SLOPE_ASPECT_DIR, "Slope.tif")
+ASPECT_PATH = os.path.join(SLOPE_ASPECT_DIR, "Aspect.tif")
+TWI_PATH = os.path.join(SLOPE_ASPECT_DIR, "TWI.sdat")
+
+# 土壤数据 (China soil) 
+SOIL_DIR = os.path.join(STATIC_DIR, "China soil")
+
+# 【新增】冻土矢量数据路径 (假设路径未变，如果变了请修改)
 FROZEN_SHP_PATH = r"E:\paper1\shuju\Frozen_soil\Frozen_soil_Ran2012.shp"
-
-# 土壤数据
-SOIL_DIR = r"E:\paper1\shuju\China soil\tiff"
-
-# 社会经济
-GDP_DIR = r"E:\paper1\shuju\GDP\2res"
-POP_DIR = r"E:\paper1\shuju\GlobPOP\2res"
 
 # --- 输出路径 ---
 OUTPUT_SHP_DIR = r"E:\paper1\shuju\shp"
@@ -47,9 +57,10 @@ if not os.path.exists(OUTPUT_CSV_DIR): os.makedirs(OUTPUT_CSV_DIR)
 TARGET_YEARS = [1990, 1995, 2000, 2005, 2010, 2015, 2020]
 
 # 随机点设置
-NUM_POINTS = 100000 
+NUM_POINTS = 100000
 MIN_DISTANCE = "1 Kilometers"
 VALID_WET_CODES = [1, 2, 3, 4, 5]
+
 
 # ================= 2. 辅助函数 =================
 
@@ -61,33 +72,37 @@ def find_file(directory, keywords, ext=".tif"):
             return os.path.join(directory, f)
     return None
 
+
 def get_year_suffix(year):
     """生成年份后缀，例如 1990 -> 90"""
     return str(year)[-2:]
 
+
 # ================= 3. 核心流程 =================
 
 def main():
-    print(">>> 开始执行集成提取任务 (V7: 冻土矢量 + 地形变量)...")
+    print(">>> 开始执行集成提取任务 (更新路径版)...")
 
     # --- 步骤 1: 生成或加载随机点 ---
     master_shp = os.path.join(OUTPUT_SHP_DIR, "Master_Sample_Points.shp")
-    
+
     if not arcpy.Exists(master_shp):
         print("  正在生成随机点模板 (基于2020年LULC)...")
+        # 路径更新为 LULC_DIR
         lulc_2020 = os.path.join(LULC_DIR, "2020.tif")
         if not os.path.exists(lulc_2020):
             print(f"  [错误] 找不到2020年LULC数据 ({lulc_2020})")
             return
-            
+
         temp_poly = os.path.join(OUTPUT_SHP_DIR, "Temp_Valid_Area.shp")
         ras = Raster(lulc_2020)
-        valid_area = Con(ras > 0, 1) 
+        # 只要有值的区域都可布点 (LULC > 0)
+        valid_area = Con(ras > 0, 1)
         arcpy.conversion.RasterToPolygon(valid_area, temp_poly, "SIMPLIFY", "VALUE")
-        
+
         print(f"  正在创建 {NUM_POINTS} 个随机点...")
         arcpy.management.CreateRandomPoints(
-            out_path=OUTPUT_SHP_DIR, 
+            out_path=OUTPUT_SHP_DIR,
             out_name="Master_Sample_Points.shp",
             constraining_feature_class=temp_poly,
             number_of_points_or_field=NUM_POINTS,
@@ -106,14 +121,11 @@ def main():
 
     # 定义一个中间文件，用于存储包含冻土属性的点
     joined_shp = os.path.join(OUTPUT_SHP_DIR, "Temp_Frozen_Joined.shp")
-    
+
     # 如果已存在先删除，防止字段冲突
     if arcpy.Exists(joined_shp): arcpy.management.Delete(joined_shp)
 
     print("  正在执行空间连接 (Spatial Join)...")
-    # 将 Master Points 与 Frozen Soil 相交，获取 CLASS_ID 等属性
-    # JOIN_ONE_TO_ONE: 保持点数不变
-    # KEEP_ALL: 保留所有点 (即使不在冻土区，属性值为Null)
     try:
         arcpy.analysis.SpatialJoin(
             target_features=master_shp,
@@ -129,34 +141,40 @@ def main():
         return
 
     # --- 步骤 3: 准备作为栅格提取输入的工作文件 ---
-    # 我们将上面带有冻土属性的文件作为新的工作文件
     working_shp = os.path.join(OUTPUT_SHP_DIR, "Temp_Process_Points.shp")
     if arcpy.Exists(working_shp): arcpy.management.Delete(working_shp)
-    
+
     arcpy.management.CopyFeatures(joined_shp, working_shp)
-    # 删除中间文件
     arcpy.management.Delete(joined_shp)
 
     # --- 步骤 4: 构建栅格提取列表 ---
     extract_list = []
-    
+
     # A. 静态变量 (地形 + TWI + 土壤)
     print("\n>>> 准备栅格变量...")
-    
-    # 1. 地形 (DEM, Slope, Aspect, TWI)
-    if os.path.exists(DEM_PATH): extract_list.append([DEM_PATH, "DEM"])
-    else: print("  [警告] 缺失 DEM")
-        
-    if os.path.exists(SLOPE_PATH): extract_list.append([SLOPE_PATH, "Slope"])
-    else: print("  [警告] 缺失 Slope")
-        
-    if os.path.exists(ASPECT_PATH): extract_list.append([ASPECT_PATH, "Aspect"])
-    else: print("  [警告] 缺失 Aspect")
-        
-    if os.path.exists(TWI_PATH): extract_list.append([TWI_PATH, "TWI"])
-    else: print("  [警告] 缺失 TWI")
 
-    # 2. 土壤
+    # 1. 地形
+    if os.path.exists(DEM_PATH):
+        extract_list.append([DEM_PATH, "DEM"])
+    else:
+        print(f"  [警告] 缺失 DEM: {DEM_PATH}")
+
+    if os.path.exists(SLOPE_PATH):
+        extract_list.append([SLOPE_PATH, "Slope"])
+    else:
+        print(f"  [警告] 缺失 Slope: {SLOPE_PATH}")
+
+    if os.path.exists(ASPECT_PATH):
+        extract_list.append([ASPECT_PATH, "Aspect"])
+    else:
+        print(f"  [警告] 缺失 Aspect: {ASPECT_PATH}")
+
+    if os.path.exists(TWI_PATH):
+        extract_list.append([TWI_PATH, "TWI"])
+    else:
+        print(f"  [警告] 缺失 TWI: {TWI_PATH}")
+
+    # 2. 土壤 (China soil)
     soil_mapping = {
         "clay1.tif": "clay1", "clay2.tif": "clay2",
         "geomor.tif": "geom", "soil_type.tif": "soil_type",
@@ -173,29 +191,50 @@ def main():
         print(f"  [警告] 土壤文件夹不存在: {SOIL_DIR}")
 
     # B. 动态年份变量 (LULC, Climate, GDP, POP)
+    print("\n>>> 准备动态年份变量...")
+
     for year in TARGET_YEARS:
         ys = get_year_suffix(year)
-        
-        # LULC
+
+        # 1. LULC (来自 5resmple)
         p = os.path.join(LULC_DIR, f"{year}.tif")
-        if os.path.exists(p): extract_list.append([p, f"LULC_{ys}"])
-        else: print(f"  [警告] 缺失 LULC {year}")
-        
-        # Climate
-        for var in ["pre", "tmp", "tmx", "tmn", "pet"]:
-            p = find_file(os.path.join(CLIMATE_DIR, var), [str(year)])
-            if not p: p = find_file(CLIMATE_DIR, [var, str(year)])
-            if p: extract_list.append([p, f"{var}_{ys}"])
-            
-        # GDP
+        if os.path.exists(p):
+            extract_list.append([p, f"LULC_{ys}"])
+        else:
+            print(f"  [警告] 缺失 LULC {year}")
+
+        # 2. Climate (来自 1Dynamic drivers/climate)
+        # 根据目录结构，climate下有 pet, pre, rhum, sard, tmn, tmp, tmx, wind 文件夹
+        # 每个文件夹里应该有对应年份的 tif
+        clim_vars = ["pet", "pre", "tmp", "tmx", "tmn"]
+        for var in clim_vars:
+            # 构建变量文件夹路径
+            var_dir = os.path.join(CLIMATE_DIR, var)
+            # 查找该年份的文件
+            p = find_file(var_dir, [str(year)])
+            if p:
+                extract_list.append([p, f"{var}_{ys}"])
+            else:
+                # 备用查找：直接在 climate 目录下找 (如果文件没分文件夹)
+                p = find_file(CLIMATE_DIR, [var, str(year)])
+                if p:
+                    extract_list.append([p, f"{var}_{ys}"])
+                else:
+                    print(f"  [警告] 缺失气候数据 {var} {year}")
+
+        # 3. GDP (来自 1Dynamic drivers/GDP)
+        # 查找 Total 和 PerCapita
         p = find_file(GDP_DIR, ["Total", str(year)])
         if p: extract_list.append([p, f"GDPT_{ys}"])
+        
         p = find_file(GDP_DIR, ["PerCapita", str(year)])
         if p: extract_list.append([p, f"GDPP_{ys}"])
-        
-        # POP
+
+        # 4. POP (来自 1Dynamic drivers/GlobPOP)
+        # 查找 Count 和 Density
         p = find_file(POP_DIR, ["Count", str(year)])
         if p: extract_list.append([p, f"POPC_{ys}"])
+        
         p = find_file(POP_DIR, ["Density", str(year)])
         if p: extract_list.append([p, f"POPD_{ys}"])
 
@@ -211,40 +250,36 @@ def main():
     # --- 步骤 6: 转换为 DataFrame 并清洗 ---
     print("\n>>> 正在处理属性表与导出...")
     fields = [f.name for f in arcpy.ListFields(working_shp) if f.type not in ['Geometry', 'OID']]
-    
-    # 检查 CLASS_ID 字段是否存在 (Spatial Join 的结果)
+
+    # 检查 CLASS_ID
     if "CLASS_ID" not in fields:
-        print("[警告] 在属性表中未找到 'CLASS_ID' 字段，冻土提取可能失败。将尝试查找类似字段...")
-        print(f"可用字段: {fields}")
-    
+        print("[警告] 在属性表中未找到 'CLASS_ID' 字段。")
+
     data_rows = []
     with arcpy.da.SearchCursor(working_shp, ["OID@", "SHAPE@X", "SHAPE@Y"] + fields) as cursor:
         for row in cursor:
             data_rows.append(row)
-            
+
     master_df = pd.DataFrame(data_rows, columns=["PointID", "Lon", "Lat"] + fields)
-    
-    # 【全局清洗】
+
+    # 全局清洗
     print(f"  初始点数: {len(master_df)}")
     master_df.dropna(inplace=True)
     print(f"  清洗后点数: {len(master_df)}")
-    
+
     if len(master_df) == 0:
         print("[错误] 所有点都被剔除了！")
         return
 
     # --- 步骤 7: 逐年拆分并导出 ---
-    
+
     # 识别静态字段
     static_cols = ["PointID", "Lon", "Lat"]
-    
-    # 查找是否有 CLASS_ID 或类似字段，并加入静态列表
     frozen_col = "CLASS_ID"
     if frozen_col in fields:
         static_cols.append(frozen_col)
-    
+
     for col in fields:
-        # 如果不是动态列，且不在基础列表中，加入静态列表
         is_dynamic = False
         for yr in TARGET_YEARS:
             if col.endswith(f"_{get_year_suffix(yr)}"):
@@ -252,41 +287,37 @@ def main():
                 break
         if not is_dynamic and col not in static_cols:
             static_cols.append(col)
-            
+
     for year in TARGET_YEARS:
         ys = get_year_suffix(year)
         print(f"\n>>> 导出年份 {year} ...")
-        
+
         current_cols = static_cols.copy()
         rename_dict = {}
-        
-        # 映射列名：CLASS_ID -> Frozen
+
         if frozen_col in master_df.columns:
             rename_dict[frozen_col] = "Frozen"
-        
+
         year_dynamic_cols = []
         for col in fields:
             if col.endswith(f"_{ys}"):
                 year_dynamic_cols.append(col)
-                base_name = col[:-3] 
+                base_name = col[:-3]
                 if base_name == "GDPT": new_name = "GDP_T"
                 elif base_name == "GDPP": new_name = "GDP_P"
                 elif base_name == "POPC": new_name = "POP_C"
                 elif base_name == "POPD": new_name = "POP_D"
                 else: new_name = base_name
                 rename_dict[col] = new_name
-        
-        # 提取子集
+
         df_year = master_df[current_cols + year_dynamic_cols].copy()
         df_year.rename(columns=rename_dict, inplace=True)
         df_year["Year"] = year
-        
-        # 导出 point_YYYY
+
         p_out = os.path.join(OUTPUT_CSV_DIR, f"point_{year}.csv")
         df_year.to_csv(p_out, index=False, encoding='utf-8-sig')
         print(f"  [1] point_{year}.csv (共 {len(df_year)} 行)")
-        
-        # 导出 wet_YYYY
+
         if "LULC" in df_year.columns:
             df_wet = df_year[df_year["LULC"].isin(VALID_WET_CODES)]
             w_out = os.path.join(OUTPUT_CSV_DIR, f"wet_{year}.csv")
@@ -298,6 +329,7 @@ def main():
     except:
         pass
     print("\n所有任务完成！")
+
 
 if __name__ == "__main__":
     main()
