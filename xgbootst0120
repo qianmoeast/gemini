@@ -1,0 +1,382 @@
+import pandas as pd
+import numpy as np
+import xgboost as xgb
+import shap
+import matplotlib.pyplot as plt
+import matplotlib
+import matplotlib.patches as mpatches
+import seaborn as sns  # [新增]
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import r2_score, mean_squared_error  # [新增] RMSE
+import glob
+import os
+import re
+import gc
+import sys
+import time
+from tqdm import tqdm  # [新增] 进度条
+from statsmodels.nonparametric.smoothers_lowess import lowess  # [新增] LOWESS 拟合
+
+# 尝试导入 geoshapley
+try:
+    import geoshapley
+    from geoshapley import GeoShapleyExplainer
+except ImportError:
+    print("提示: 未检测到 geoshapley，请先安装: pip install geoshapley")
+
+# 绘图设置
+plt.style.use('seaborn-v0_8-whitegrid')
+fonts = ['SimHei', 'Microsoft YaHei', 'Arial Unicode MS']
+plt.rcParams['font.sans-serif'] = fonts
+plt.rcParams['axes.unicode_minus'] = False
+
+# ==========================================
+# 0. 用户配置区 (User Configuration)
+# ==========================================
+INPUT_DIR = r"E:\paper1\excel\point\2"
+OUTPUT_DIR = r"E:\paper1\result\final_plots_enhanced"  # 修改输出目录名以示区分
+WETLAND_CODES = [1, 2, 3, 4, 5]
+
+# --- 【核心控制开关】 ---
+CONFIG = {
+    "USE_FULL_DATA": False,
+    "SHAP_SAMPLE_SIZE": 2000,
+    "GEOSHAP_SAMPLE_SIZE": 100,
+    "GEOSHAP_BG_SIZE": 10,
+    "EXCLUDE_GEO_IN_IMPORTANCE": True,
+    # [新增] LOWESS 绘图配置
+    "PLOT_LOWESS": True,
+    "LOWESS_FRAC": 0.3,
+    "LOWESS_SAMPLE_SIZE": 2000  # 绘图时抽样点数，防卡死
+}
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+print(f"结果将保存至: {OUTPUT_DIR}")
+print(f"当前配置: {CONFIG}")
+
+# ==========================================
+# 1. 获取文件列表
+# ==========================================
+file_pattern = os.path.join(INPUT_DIR, "point_*.csv")
+all_files = glob.glob(file_pattern)
+
+if not all_files:
+    raise FileNotFoundError(f"在 {INPUT_DIR} 未找到 point_*.csv 文件。")
+
+print(f"共发现 {len(all_files)} 个年份的数据文件，准备开始分析...")
+
+# ==========================================
+# 2. 逐年循环分析
+# ==========================================
+for filepath in all_files:
+    gc.collect()
+
+    filename = os.path.basename(filepath)
+    match = re.search(r'\d{4}', filename)
+    year = match.group(0) if match else "UnknownYear"
+
+    print(f"\n{'=' * 50}")
+    print(f"正在处理年份: {year}")
+    print(f"{'=' * 50}")
+
+    start_time = time.time()
+    formatted_start_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(start_time))
+    print(f"开始时间: {formatted_start_time}")
+
+    try:
+        # --- 2.1 数据准备 ---
+        data = pd.read_csv(filepath)
+        data = data[data['LULC'] != -9999].copy()
+        data = data.dropna(subset=['LULC', 'Lat', 'Lon'])
+
+        # 构建目标 (0/1)
+        data['Is_Wetland'] = data['LULC'].isin(WETLAND_CODES).astype(int)
+        y = data['Is_Wetland']
+
+        if y.sum() == 0 or (len(y) - y.sum()) == 0:
+            print(f"[{year}] 样本单一，跳过。")
+            continue
+
+        # 特征筛选
+        ignore_cols = [
+            'PointID', 'CID', 'grid_code', 'Join_Count', 'TARGET_FID',
+            'MERGE1_', 'MERGE1_ID', 'CHINAPERM', 'REGION', 'AREA', 'PERIMETER',
+            'LULC', 'Is_Wetland', 'Year'
+        ]
+        feature_names = [c for c in data.columns if c not in ignore_cols and c not in ['Lat', 'Lon']]
+
+        X = data[feature_names].copy()
+        X = X.fillna(X.mean())
+
+        # 标准化
+        scaler = StandardScaler()
+        X_scaled = pd.DataFrame(scaler.fit_transform(X), columns=feature_names)
+        df_features = X_scaled.copy()
+
+        # 拼接坐标
+        df_features['LAT'] = data['Lat'].values
+        df_features['LON'] = data['Lon'].values
+
+        # =============================================================================
+        # 3. 训练 XGBoost 模型
+        # =============================================================================
+        print("\n--- 步骤 2: 正在训练 XGBoost 模型 ---")
+
+        X_train, X_test, y_train, y_test = train_test_split(
+            df_features, y, test_size=0.2, random_state=42
+        )
+
+        model = xgb.XGBRegressor(
+            n_estimators=100,
+            max_depth=5,
+            learning_rate=0.1,
+            objective='reg:squarederror',
+            random_state=42,
+            n_jobs=-1
+        )
+
+        model.fit(X_train, y_train)
+        print("模型训练完成。")
+
+        # =============================================================================
+        # [新增] 3.1 预测性能可视化 (Observed vs Predicted)
+        # =============================================================================
+        print(f"[{year}] 绘制预测性能散点图...")
+        y_pred = model.predict(X_test)
+        
+        # 计算指标
+        r2 = r2_score(y_test, y_pred)
+        rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+        
+        plt.figure(figsize=(6, 6))
+        sns.scatterplot(x=y_test, y=y_pred, alpha=0.3)
+        # 绘制对角线
+        p_min, p_max = min(y.min(), y_pred.min()), max(y.max(), y_pred.max())
+        plt.plot([p_min, p_max], [p_min, p_max], 'r--', lw=2)
+        
+        plt.xlabel("Observed")
+        plt.ylabel("Predicted")
+        plt.title(f"Observed vs Predicted ({year})")
+        plt.text(0.05, 0.95, f"R² = {r2:.4f}", transform=plt.gca().transAxes, fontsize=12)
+        plt.text(0.05, 0.90, f"RMSE = {rmse:.4f}", transform=plt.gca().transAxes, fontsize=12)
+        plt.tight_layout()
+        plt.savefig(os.path.join(OUTPUT_DIR, f"Scatter_Obs_vs_Pred_{year}.jpg"), dpi=300)
+        plt.close()
+
+        # =============================================================================
+        # 4. 特征重要性分析 (Feature Importance)
+        # =============================================================================
+        print(f"[{year}] 绘制特征重要性图...")
+        importances = model.feature_importances_
+        current_feat_names = X_train.columns.tolist()
+        df_importance = pd.DataFrame({'feature': current_feat_names, 'importance': importances})
+
+        if CONFIG["EXCLUDE_GEO_IN_IMPORTANCE"]:
+            df_importance = df_importance[~df_importance['feature'].isin(['LAT', 'LON'])]
+
+        df_importance = df_importance.sort_values(by='importance', ascending=True)
+
+        fig, ax = plt.subplots(figsize=(12, 10))
+        df_plot_imp = df_importance.tail(25)
+        bars = ax.barh(df_plot_imp['feature'], df_plot_imp['importance'], color='#d62828')
+        ax.set_title(f'Feature importance values ({year})', fontsize=18)
+        
+        # 数值标签
+        for bar in bars:
+            width = bar.get_width()
+            ax.text(width, bar.get_y() + bar.get_height()/2, f' {width:.3f}', va='center', fontsize=10)
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(OUTPUT_DIR, f"Feature_Importance_{year}.jpg"), dpi=300)
+        plt.close()
+
+        # =============================================================================
+        # 5. SHAP 分析 (Core SHAP)
+        # =============================================================================
+        print(f"[{year}] SHAP 分析...")
+        explainer = shap.TreeExplainer(model)
+
+        if CONFIG["USE_FULL_DATA"]:
+            X_shap = df_features
+        else:
+            sample_n = min(CONFIG["SHAP_SAMPLE_SIZE"], len(df_features))
+            X_shap = df_features.sample(sample_n, random_state=42)
+
+        shap_values_obj = explainer(X_shap)
+        # 提取 numpy 数组用于自定义绘图
+        shap_values_arr = shap_values_obj.values
+
+        # 过滤掉 LAT/LON 用于绘图
+        cols = X_shap.columns
+        non_geo_cols = [c for c in cols if c not in ['LAT', 'LON']]
+        
+        # 5.1 SHAP Summary (Beeswarm)
+        plt.figure(figsize=(10, 8))
+        shap.summary_plot(shap_values_obj[:, non_geo_cols], X_shap[non_geo_cols],
+                          plot_type="dot", cmap="RdYlBu", show=False)
+        plt.savefig(os.path.join(OUTPUT_DIR, f"SHAP_Summary_{year}.jpg"), dpi=300, bbox_inches='tight')
+        plt.close()
+
+        # 5.2 SHAP Bar Plot
+        plt.figure(figsize=(10, 8))
+        shap.summary_plot(shap_values_obj[:, non_geo_cols], X_shap[non_geo_cols],
+                          plot_type="bar", show=False)
+        plt.savefig(os.path.join(OUTPUT_DIR, f"SHAP_Bar_{year}.jpg"), dpi=300, bbox_inches='tight')
+        plt.close()
+
+        # [新增] 5.3 Waterfall Plot (第一个样本)
+        print(f"[{year}] 绘制 Waterfall Plot...")
+        plt.figure()
+        # 注意：这里使用 shap_values_obj[0]
+        shap.plots.waterfall(shap_values_obj[0], show=False)
+        plt.tight_layout()
+        plt.savefig(os.path.join(OUTPUT_DIR, f"SHAP_Waterfall_{year}.jpg"), dpi=300, bbox_inches='tight')
+        plt.close()
+
+        # [新增] 5.4 LOWESS 拟合依赖图 (批量生成)
+        if CONFIG["PLOT_LOWESS"]:
+            print(f"[{year}] 生成 LOWESS 拟合依赖图...")
+            
+            # 准备绘图数据 (使用 shap 样本)
+            plot_cols = [c for c in non_geo_cols] # 排除经纬度
+            
+            # 用于保存交点信息
+            intersections = []
+            
+            # 随机种子
+            rng = np.random.RandomState(42)
+
+            for col_name in tqdm(plot_cols, desc=f"[{year}] 绘制依赖图"):
+                try:
+                    # 获取列索引
+                    col_idx = list(cols).index(col_name)
+                    
+                    # 获取特征值和SHAP值
+                    feature_val = X_shap[col_name].values
+                    shap_val = shap_values_arr[:, col_idx]
+                    
+                    plt.figure(figsize=(6, 4))
+                    
+                    # 判断是否为二分类变量 (0/1)
+                    unique_vals = np.unique(feature_val)
+                    if len(unique_vals) <= 2 and set(unique_vals).issubset({0, 1}):
+                        # 箱线图
+                        sns.boxplot(x=feature_val, y=shap_val, palette="Set2")
+                    else:
+                        # 散点 + LOWESS
+                        plt.scatter(feature_val, shap_val, alpha=0.2, s=10, color="#66c2ff")
+                        
+                        # 抽样拟合 (防止太慢)
+                        if len(feature_val) > CONFIG["LOWESS_SAMPLE_SIZE"]:
+                            idx = rng.choice(len(feature_val), CONFIG["LOWESS_SAMPLE_SIZE"], replace=False)
+                            fit_x = feature_val[idx]
+                            fit_y = shap_val[idx]
+                        else:
+                            fit_x, fit_y = feature_val, shap_val
+                            
+                        # 计算 LOWESS
+                        lowess_fit = lowess(fit_y, fit_x, frac=CONFIG["LOWESS_FRAC"])
+                        # 排序以便画线
+                        fit_order = np.argsort(lowess_fit[:, 0])
+                        x_vals = lowess_fit[fit_order, 0]
+                        y_vals = lowess_fit[fit_order, 1]
+                        
+                        plt.plot(x_vals, y_vals, color="red", linewidth=2)
+                        
+                        # 计算交点 (y=0)
+                        for j in range(len(y_vals) - 1):
+                            y1, y2 = y_vals[j], y_vals[j+1]
+                            x1, x2 = x_vals[j], x_vals[j+1]
+                            if y1 * y2 < 0: # 穿过 x 轴
+                                x_inter = x1 - y1 * (x2 - x1) / (y2 - y1)
+                                intersections.append({"Year": year, "Feature": col_name, "Intersection_X": float(x_inter)})
+
+                    # 通用修饰
+                    plt.axhline(0, color="black", linestyle="--", linewidth=1.5)
+                    plt.xlabel(col_name) # 注意：这里是标准化后的值
+                    plt.ylabel("SHAP value")
+                    plt.title(f"Dependence Plot: {col_name}")
+                    plt.tight_layout()
+                    plt.savefig(os.path.join(OUTPUT_DIR, f"Dependence_Lowess_{year}_{col_name}.jpg"), dpi=300)
+                    plt.close()
+                    
+                except Exception as e_plot:
+                    # 某个特征画图失败不影响主流程
+                    # print(f"绘制 {col_name} 失败: {e_plot}") 
+                    pass
+
+            # 保存交点数据
+            if intersections:
+                pd.DataFrame(intersections).to_csv(os.path.join(OUTPUT_DIR, f"Intersections_{year}.csv"), index=False)
+
+        # =============================================================================
+        # 6. GeoShapley 分析
+        # =============================================================================
+        print(f"[{year}] GeoShapley 分析...")
+
+        bg_size = CONFIG["GEOSHAP_BG_SIZE"]
+        bg_data = X_train.sample(min(bg_size, len(X_train)), random_state=42)
+        geoshap_explainer = GeoShapleyExplainer(model.predict, bg_data)
+
+        try:
+            sample_n = min(CONFIG["GEOSHAP_SAMPLE_SIZE"], len(df_features))
+            data_to_explain = df_features.sample(sample_n, random_state=42)
+            
+            # 单核运行防止 OOM
+            geoshapley_results = geoshap_explainer.explain(data_to_explain, n_jobs=1)
+
+            # --- GeoShapley Diverging Bar ---
+            print(f"[{year}] 绘制 GeoShapley 图表...")
+            non_spatial_feats = [f for f in current_feat_names if f not in ['LAT', 'LON']]
+
+            mean_primary = pd.Series(geoshapley_results.primary.mean(axis=0), index=non_spatial_feats)
+            mean_interaction = pd.Series(geoshapley_results.geo_intera.mean(axis=0),
+                                         index=[f'{f} x GEO' for f in non_spatial_feats])
+            mean_spatial = pd.Series(geoshapley_results.geo.mean(), index=['GEO'])
+
+            df_plot = pd.concat([mean_primary, mean_interaction, mean_spatial]).reset_index()
+            df_plot.columns = ['Variable', 'Value']
+            df_plot['AbsValue'] = df_plot['Value'].abs()
+            
+            # 取 Top 15
+            df_plot_top = df_plot.sort_values('AbsValue', ascending=False).head(15).sort_values('Value', ascending=True)
+            df_plot_top['Color'] = ['#e69f00' if x >= 0 else '#0072b2' for x in df_plot_top['Value']]
+
+            fig3, ax3 = plt.subplots(figsize=(10, 8))
+            ax3.barh(df_plot_top['Variable'], df_plot_top['Value'], color=df_plot_top['Color'])
+            
+            for _, row in df_plot_top.iterrows():
+                val = row['Value']
+                offset = max(df_plot_top['AbsValue']) * 0.02 * (1 if val > 0 else -1)
+                ax3.text(val + offset, row['Variable'], f'{val:.3f}', ha='left' if val > 0 else 'right', va='center')
+
+            ax3.axvline(0, color='black', lw=0.8)
+            ax3.set_title(f'Geoshapley values ({year})', fontsize=16)
+            plt.savefig(os.path.join(OUTPUT_DIR, f"GeoShapley_DivergingBar_{year}.jpg"), dpi=300, bbox_inches='tight')
+            plt.close()
+
+            # GeoShapley Beeswarm
+            plt.figure(figsize=(10, 8))
+            geoshapley_results.summary_plot(include_interaction=True, cmap='RdYlBu')
+            plt.title(f"GeoShapley Value Summary ({year})", fontsize=16)
+            plt.savefig(os.path.join(OUTPUT_DIR, f"GeoShapley_Beeswarm_{year}.jpg"), dpi=300, bbox_inches='tight')
+            plt.close()
+
+        except Exception as e:
+            print(f"[{year}] GeoShapley 计算失败: {e}")
+            import traceback
+            traceback.print_exc()
+
+        # 打印耗时
+        elapsed_seconds = time.time() - start_time
+        print(f"[{year}] 处理完成，耗时: {elapsed_seconds/60:.2f} 分钟")
+
+    except Exception as e:
+        print(f"处理年份 {year} 时出错: {e}")
+        import traceback
+        traceback.print_exc()
+        continue
+
+print(f"\n{'=' * 50}")
+print(f"所有任务完成！")
